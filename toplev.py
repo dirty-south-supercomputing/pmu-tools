@@ -140,10 +140,11 @@ class PerfFeatures:
         if not self.logfd_supported:
             sys.exit("perf binary is too old or perf is disabled in /proc/sys/kernel/perf_event_paranoid")
         self.supports_power = works(perf + " list  | grep -q power/")
-        # problem in 4.12. fixed in v4.14, suppresses duplicate events
-        self.supports_nomerge = works(perf + " stat --no-merge true")
         # guests don't support offcore response
         self.supports_ocr = works(perf + " stat -e '{cpu/event=0xb7,umask=1,offcore_rsp=0x123/,instructions}' true")
+        self.has_max_precise = os.path.exists("/sys/devices/cpu/caps/max_precise")
+        if self.has_max_precise:
+            self.max_precise = int(open("/sys/devices/cpu/caps/max_precise").read())
 
 def kv_to_key(v):
     return v[0] * 100 + v[1]
@@ -511,14 +512,11 @@ def raw_event(i, name="", period=False):
         oi = i
         if re.match("^[0-9]", name):
             name = "T" + name
-        i = e.output(noname=True, name=name, period=period)
-        if len(re.findall(r'[a-z0-9_]+/.*?/[a-z]*', i)) > 1:
-            print "Event", oi, "maps to multiple units. Ignored."
-            return "dummy" # FIXME
+	i = e.output(noname=True, name=name, period=period, noexplode=True)
+	# hack for running tl-tester on on client system where cha doesn't have a cmask
+	if i.startswith("uncore_cha") and ",cmask" in i and not ocperf.has_format("cmask", "uncore_cha_0"):
+	    i = i.replace(",cmask=1", "")
         emap.update_event(e.output(noname=True), e)
-        # next three things should be moved somewhere else
-        if i.startswith("uncore"):
-            outgroup_events.add(i)
         if e.counter != cpu.standard_counters and not e.counter.startswith("Fixed"):
             # for now use the first counter only to simplify
             # the assignment. This is sufficient for current
@@ -533,6 +531,10 @@ def raw_event(i, name="", period=False):
                 errata_events[orig_i] = e.errata
             else:
                 errata_warn_events[orig_i] = e.errata
+    if not i.startswith("cpu"):
+	if not i.startswith("uncore"):
+	    valid_events.add_event(i)
+	outgroup_events.add(i)
     return i
 
 # generate list of converted raw events from events string
@@ -570,8 +572,6 @@ def perf_args(evstr, rest):
     add = []
     if interval_mode:
         add += ['-I', str(interval_mode)]
-    if feat.supports_nomerge:
-        add.append('--no-merge')
     return [perf, "stat", "-x;", "--log-fd", "X"] + add + ["-e", evstr]  + rest
 
 def setup_perf(evstr, rest):
@@ -605,11 +605,14 @@ class ValidEvents:
         self.string = "|".join(self.valid_events)
 
     def __init__(self):
-        self.valid_events = [r"cpu/.*?/", "uncore.*?/.*?/", "ref-cycles",
+	self.valid_events = [r"cpu/.*?/", "uncore.*?/.*?/", "ref-cycles", "power.*",
+			     r"msr.*", "emulation-faults",
                              r"r[0-9a-fA-F]+", "cycles", "instructions", "dummy"]
         self.update()
 
     def add_event(self, ev):
+	if re.match(self.string, ev):
+	    return
         # add first to overwrite more generic regexprs list r...
         self.valid_events.insert(0, ev)
         self.update()
@@ -840,8 +843,23 @@ perf_fields = [
     r"Joules",
     ""]
 
+def group_join(events):
+    e = ""
+    last = None
+    sep = ""
+    for j in events:
+        e += sep
+        # add dummy event to separate identical events to avoid merging
+        # in perf stat
+        if last == j[0] and sep:
+            e += "emulation-faults,"
+        e += event_group(j)
+        sep = ","
+        last = j[-1]
+    return e
+
 def do_execute(runner, events, out, rest, res, rev, valstats, env):
-    evstr = ",".join(map(event_group, events))
+    evstr = group_join(events)
     account = defaultdict(Stat)
     inf, prun = setup_perf(evstr, rest)
     prev_interval = 0.0
@@ -902,6 +920,11 @@ def do_execute(runner, events, out, rest, res, rev, valstats, env):
             print "unparseable perf output"
             sys.stdout.write(l)
             continue
+
+        # dummy event used as separator to avoid merging problems
+        if event == "emulation-faults":
+            continue
+
         title = title.replace("CPU", "")
         # code later relies on stripping ku flags
         event = event.replace("/k", "/").replace("/u", "/")
@@ -939,15 +962,14 @@ def do_execute(runner, events, out, rest, res, rev, valstats, env):
         # to all cpus in the socket to make the result lists match
         # unless we use -A ??
         # also -C xxx causes them to be duplicated too, unless single thread
-        if ((event.startswith("power") or event.startswith("uncore")) and
+	if (re.match(r'power|uncore', event) and
                 title != "" and (not (args.core and not args.single_thread))):
             cpunum = int(title)
             socket = cpu.cputosocket[cpunum]
             for j in cpu.sockettocpus[socket]:
-                if not args.core or display_core(j, True):
-                    res["%d" % (j)].append(val)
-                    rev["%d" % (j)].append(event)
-                    valstats["%d" % (j)].append(st)
+                res["%d" % (j)].append(val)
+                rev["%d" % (j)].append(event)
+                valstats["%d" % (j)].append(st)
         else:
             res[title].append(val)
             rev[title].append(event)
@@ -976,8 +998,6 @@ def ev_append(ev, level, obj):
         obj.evlevels.append((ev, level, obj.name))
     if has(obj, 'nogroup') and obj.nogroup:
         outgroup_events.add(ev.lower())
-    if not ev.startswith("cpu"):
-        valid_events.add_event(ev)
     return 99
 
 def canon_event(e):
@@ -1001,7 +1021,7 @@ def do_event_rmap(e):
     if n.upper() in fixes:
         n = fixes[n.upper()].lower()
         if n:
-            return n
+	    return n
     return "dummy"
 
 rmap_cache = dict()
@@ -1199,7 +1219,7 @@ Warning: Hyper Threading may lead to incorrect measurements for this node.
 Suggest to re-measure with HT off (run cputop.py "thread == 1" offline | sh)."""
     return desc
 
-def node_filter(obj, test):
+def node_filter(obj, default):
     if args.nodes:
         fname = full_name(obj)
         name = obj.name
@@ -1217,7 +1237,7 @@ def node_filter(obj, test):
                 i += 1
             if match(j[i:]):
                 return True
-    return test()
+    return default
 
 SIB_THRESH = 0.05
 
@@ -1363,11 +1383,10 @@ class Runner:
             if args.reduced and has(obj, 'server') and not obj.server:
                 return False
             if not obj.metric:
-                return node_filter(obj, lambda: obj.level <= self.max_level)
+                return node_filter(obj, obj.level <= self.max_level)
             else:
-                return node_filter(obj,
-                        lambda: (args.metrics or obj.name in add_met)
-                                 and not obj.name in remove_met)
+                want = (args.metrics or obj.name in add_met) and not obj.name in remove_met
+                return node_filter(obj, want)
 
         self.olist = filter(want_node, self.olist)
 
@@ -1646,6 +1665,11 @@ class Runner:
             print j,
         print
 
+def supports_pebs():
+    if feat.has_max_precise:
+        return feat.max_precise > 0
+    return not cpu.hypervisor
+
 def remove_pp(s):
     if s.endswith(":pp"):
         return s[:-3]
@@ -1655,22 +1679,32 @@ def clean_event(e):
     return remove_pp(e).replace(".", "_").replace(":", "_").replace('=','')
 
 def do_sample(sample_obj, rest, count):
-    # XXX use :ppp if available
     samples = [("cycles:pp", "Precise cycles", )]
     for obj in sample_obj:
         for s in obj.sample:
             samples.append((s, obj.name))
     nsamp = [x for x in samples if not unsup_event(x[0], unsup_events)]
-    nsamp = [(remove_pp(x[0]), x[1]) if unsup_event(x[0], unsup_pebs) else x
-                for x in nsamp]
+    nsamp = [(remove_pp(x[0]), x[1])
+             if unsup_event(x[0], unsup_pebs) else x
+             for x in nsamp]
     if cmp(nsamp, samples):
         missing = [x[0] for x in set(samples) - set(nsamp)]
         if not args.quiet:
             print >>sys.stderr, "warning: update kernel to handle sample events:"
             print >>sys.stderr, "\n".join(missing)
+
+    def force_pebs(ev):
+        return ev.startswith("FRONTEND_") or ("PREC_DIST" in ev)
+
+    no_pebs = not supports_pebs()
+    if no_pebs:
+        nsamp = [x for x in nsamp if not force_pebs(x[0])]
     sl = [raw_event(s[0], s[1] + "_" + clean_event(s[0]), period=True) for s in nsamp]
     sl = add_filter(sl)
     sample = ",".join([x for x in sl if x])
+    if no_pebs:
+        sample = re.sub(r'/p+', '/', sample)
+        sample = re.sub(r':p+', '', sample)
     print "Sampling:"
     extra_args = args.sample_args.replace("+", "-").split()
     perf_data = args.sample_basename
@@ -1698,9 +1732,9 @@ def sysctl(name):
 
 # check nmi watchdog
 if sysctl("kernel.nmi_watchdog") != 0:
-    sys.exit("Please disable the NMI watchdog as it permanently consumes one "
-             "hw-PMU counter.\n"
-             "(echo 0 > /proc/sys/kernel/nmi_watchdog)")
+    cpu.counters -= 1
+    print >>sys.stderr, "Consider disabling nmi watchdog"
+    print >>sys.stderr, "(echo 0 > /proc/sys/kernel/nmi_watchdog as root)"
 
 if cpu.cpu is None:
     sys.exit("Unsupported CPU model %d" % (cpu.model,))
