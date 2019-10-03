@@ -5,6 +5,24 @@ analysis on Intel CPUs on top of [Linux perf](https://perf.wiki.kernel.org/index
 
 # Recent new features:
 
+* toplev update to Ahmad Yasin's/Anton Hanna's TMA 3.6:
+	- {Load|Store}_STLB_(Hit|Miss): new metrics that breakdown DTLB_{Load|Store} costs
+	- L2_Evictions_(Silent|NonSilent)_PKI: L2 (silent|non silent) evictions rate per Kilo instructios
+	- IpFarBranch - Instructions per Far Branch
+	- Renamed 0/1/2/3m_Ports_Utilized
+	- DSB_Switches is now available
+	- Count Domain changes for multiple nodes. New threshold for IpTB ( Instructions per Taken Branches )
+	- Re-organized/renamed Metric Group (e.g. Frontend_Bound => Frontend)
+* toplev now can run with the NMI watchdog enabled
+	- This may reduce the need for being root to change this setting
+	- It may still require kernel.perf_event_paranoid settings <1, unless
+	  --single-thread --user is used. Some functionality like uncore
+	  monitoring requires root or kernel.perf_event_paranoid < 0.
+* toplev now supports running in KVM guests
+	- The guest needs to have the PMU enabled (e.g. -cpu host for qemu)
+	- The guest should report the same CPU type as the host (also -cpu host),
+	  otherwise the current CPU needs to be overriden with FORCECPU=../EVENTMAP=..
+	- PEBS sampling, offcore response, and uncore monitoring are not supported
 * toplev update to Ahmad Yasin's TMA 3.5:
 	- Support for Cascade Lake
 	- Add PMM_Bound nodes for persistent memory

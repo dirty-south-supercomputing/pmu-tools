@@ -30,6 +30,7 @@
 # PERF=... perf binary to use (default "perf")
 # EVENTMAP=eventmap
 # EVENTMAP2=eventmap
+# EVENTMAP3=eventmap
 # OFFCORE=eventmap
 # UNCORE=eventmap
 # UNCORE2=eventmap
@@ -71,7 +72,6 @@ experimental = False
 exists_cache = dict()
 
 topology = None
-file_exists = dict()
 
 def file_exists(s):
     if s in exists_cache:
@@ -93,6 +93,13 @@ def file_exists(s):
 
 def has_format(s, pmu="cpu"):
     return file_exists("/sys/devices/%s/format/%s" % (pmu, s))
+
+warned = set()
+
+def warn_once(s):
+    if s not in warned:
+        print >>sys.stderr, s
+        warned.add(s)
 
 class PerfVersion:
     def __init__(self):
@@ -155,7 +162,7 @@ qualval_map = (
     (r"(?:sa|sample-after|period)=([0-9]+)", "period=%d", 0))
 
 uncore_map = (
-    (r'Match=(0x[0-9a-f])', "filter_occ="),
+    (r'[Mm]atch=(0x[0-9a-fA-F]+)', "filter_occ="),
     (r'filter1=(0x[0-9a-fA-F]+)', "config1=", 32),
     ("nc=(\d+)", "filter_nc="),
     (r'filter=(0x[0-9a-fA-F]+)', "config1="),
@@ -253,19 +260,17 @@ class Event:
             ename = "cpu/%s/" % (self.output_newstyle(extra=",".join(newe), noname=noname, period=period, name=name)) + extra
         return ename
 
+    def filter_qual(self):
+        pass
+
 box_to_perf = {
     "cbo": "cbox",
     "qpi_ll": "qpi",
     "sbo": "sbox",
 }
 
-box_cache = dict()
-
 def box_exists(box):
-    n = "/sys/devices/uncore_%s" % (box)
-    if n not in box_cache:
-        box_cache[n] = file_exists(n)
-    return box_cache[n]
+    return file_exists("/sys/devices/uncore_%s" % (box))
 
 def int_or_zero(row, name):
     if name in row:
@@ -282,6 +287,30 @@ uncore_units = {
     "m3kti": "m3upi",
     "upi ll": "upi",
 }
+
+def convert_uncore(flags):
+    o = ""
+    while flags:
+        for j in uncore_map:
+            match, repl = j[0], j[1]
+            m = re.match(match, flags)
+            if m:
+                if repl == "":
+                    pass
+                elif len(j) > 2:
+                    o += "," + repl + ("%#x" % (int(m.group(1), 0) << j[2]))
+                else:
+                    o += "," + repl + m.group(1)
+                flags = flags[m.end():]
+            if flags == "":
+                break
+            if flags[0:1] == ":":
+                flags = flags[1:]
+        else:
+            if flags != "":
+                print >>sys.stderr, "Uncore cannot parse", flags
+                break
+    return o
 
 class UncoreEvent:
     def __init__(self, name, row):
@@ -350,28 +379,10 @@ class UncoreEvent:
                 flags += ","
             flags += e.newextra
 
-	one_unit = False
+        one_unit = "one_unit" in flags
+        o += convert_uncore(flags)
 
         # xxx subctr, occ_sel, filters
-        if flags:
-            for j in uncore_map:
-                match, repl = j[0], j[1]
-                m = re.match(match, flags)
-                if m:
-		    if repl == "":
-			if match.startswith("one_unit"):
-			    one_unit = True
-		    elif len(j) > 2:
-                        o += "," + repl + ("%#x" % (int(m.group(1), 0) << j[2]))
-                    else:
-                        o += "," + repl + m.group(1)
-                    flags = flags[m.end():]
-                if flags == "":
-                    break
-                if flags[0:1] == ":":
-                    flags = flags[1:]
-            if flags != "":
-                print >>sys.stderr, "Uncore cannot parse", flags
         if version.has_name and not noname:
             if name == "":
                 name = e.name.replace(".", "_")
@@ -391,6 +402,22 @@ class UncoreEvent:
             return ",".join(["uncore_" + box_name(x) + o.replace("_NUM", "_%d" % (x)) for x in
                              itertools.takewhile(box_n_exists, itertools.count())])
         return "uncore_%s%s" % (e.unit, o.replace("_NUM", ""))
+
+    def filter_qual(self):
+        def check_qual(q):
+            if q == "":
+                return False
+            if q == "one_unit":
+                return True
+            if "=" in q:
+                q, _ = q.split("=")
+            if has_format(q, self.unit) or has_format(q, self.unit + "_0"):
+                return True
+            warn_once("%s: format %s not supported. Filtering out" % (self.unit, q))
+            return False
+
+        self.newextra = ",".join(filter(check_qual, convert_uncore(self.newextra).split(",")))
+
 
     output = output_newstyle
 
@@ -438,14 +465,14 @@ missing_boxes = set()
 def check_uncore_event(e):
     if uncore_exists(e.unit):
         if e.cmask and not uncore_exists(e.unit, "/format/cmask"):
-            print >>sys.stderr, "Uncore unit", e.unit, "missing cmask for", e.name
+            warn_once("Uncore unit " + e.unit + " missing cmask for " + e.name)
             return None
         if e.umask and not uncore_exists(e.unit, "/format/umask"):
-            print >>sys.stderr, "Uncore unit", e.unit, "missing umask for", e.name
+            warn_once("Uncore unit " + e.unit + " missing umask for " + e.name)
             return None
         return e
     if e.unit not in missing_boxes:
-        print >>sys.stderr, "Uncore unit", e.unit, "missing"
+        warn_once("Uncore unit " + e.unit + " missing")
         missing_boxes.add(e.unit)
     return None
 
@@ -493,18 +520,15 @@ class EmapNativeJSON(object):
             anyf = 0
             if name in fixed_counters:
                 code, umask, anyf = fixed_counters[name]
-            if 'other' in m and m['other'] in row:
+            if m['other'] in row:
                 other = gethex('other') << 16
             else:
                 other = 0
-            if 'edge' in m:
-                other |= gethex('edge') << 18
-            if 'any' in m and m['any'] in row:
+            other |= gethex('edge') << 18
+            if m['any'] in row:
                 other |= (gethex('any') | anyf) << 21
-            if 'cmask' in m:
-                other |= getdec('cmask') << 24
-            if 'invert' in m:
-                other |= gethex('invert') << 23
+            other |= getdec('cmask') << 24
+            other |= gethex('invert') << 23
             val = code | (umask << 8) | other
             val &= EVMASK
             d = get('desc')
@@ -524,8 +548,7 @@ class EmapNativeJSON(object):
                     e.extra += "u"
                 if other & (1<<17):
                     e.extra += "k"
-            if ('msr_index' in m and m['msr_index'] in row
-                    and get('msr_index') and get('msr_value')):
+            if (m['msr_index'] in row and get('msr_index') and get('msr_value')):
                 msrnum = gethex('msr_index')
                 msrval = gethex('msr_value')
                 if version.offcore and msrnum in (0x1a6, 0x1a7):
@@ -538,7 +561,7 @@ class EmapNativeJSON(object):
                 else:
                     e.msrval = msrval
                     e.msr = msrnum
-            if 'overflow' in m and m['overflow'] in row:
+            if m['overflow'] in row:
                 e.overflow = get('overflow')
                 #if e.overflow == "0":
                 #    print >>sys.stderr, "Warning: %s has no overflow value" % (name,)
@@ -722,6 +745,13 @@ class EmapNativeJSON(object):
             except UnicodeEncodeError:
                 pass
 
+def handle_io_error(f, name, warn=False):
+    try:
+        f(name)
+    except IOError:
+        if warn:
+            print >>sys.stderr, "Cannot open", name
+
 def json_with_extra(el):
     name = event_download.eventlist_name(el, "core")
     emap = EmapNativeJSON(name)
@@ -767,21 +797,18 @@ def add_extra_env(emap, el):
                     emap.add_uncore(uc)
     except IOError:
         print >>sys.stderr, "Cannot open", uc
-    try:
-        e2 = os.getenv("EVENTMAP2")
-        if e2:
-            e2 = canon_emapvar(e2, "core")
-            emap.read_events(e2)
-            # don't try to download for now
-    except IOError:
-        print >>sys.stderr, "Cannot open", e2
-    try:
-        u2 = os.getenv("UNCORE2")
-        if u2:
-            u2 = canon_emapvar(u2, "uncore")
-            emap.add_uncore(u2, True)
-    except IOError:
-        print >>sys.stderr, "Cannot open", u2
+    def read_map(env, typ, r):
+        try:
+            e2 = os.getenv(env)
+            if e2:
+                e2 = canon_emapvar(e2, typ)
+                r(e2)
+                # don't try to download for now
+        except IOError:
+            print >>sys.stderr, "Cannot open", e2
+    read_map("EVENTMAP2", "core", lambda r: emap.read_events(r))
+    read_map("EVENTMAP3", "core", lambda r: emap.read_events(r))
+    read_map("UNCORE2", "uncore", lambda r: emap.add_uncore(r))
     return emap
 
 def canon_emapvar(el, typ):
@@ -822,6 +849,7 @@ def find_emap():
         if not force_download:
             emap = json_with_extra(el)
             if emap:
+                add_extra_env(emap, el)
                 return emap
     except IOError:
         pass
@@ -831,12 +859,13 @@ def find_emap():
             toget.append("offcore")
         if not os.getenv("UNCORE"):
             toget.append("uncore")
-        if not os.getenv("UNCORE"):
-            toget.append("uncore")
         if experimental:
             toget += [x + " experimental" for x in toget]
         event_download.download(el, toget)
-        return json_with_extra(el)
+        emap = json_with_extra(el)
+        if emap:
+            add_extra_env(emap, el)
+            return emap
     except IOError:
         pass
     return None

@@ -53,6 +53,7 @@ fixed_to_num = {
     "cpu/event=0x3c,umask=0x00,any=1/": 1,
     "cpu/event=0x3c,umask=0x0,any=1/": 1,
     "ref-cycles" : 2,
+    "cpu/event=0x0,umask=0x3/": 2,
     "cpu/event=0x0,umask=0x3,any=1/" : 2,
 }
 
@@ -130,6 +131,13 @@ perf = os.getenv("PERF")
 if not perf:
     perf = "perf"
 
+warned = set()
+
+def warn_once(msg):
+    if msg not in warned:
+        print >>sys.stderr, msg
+        warned.add(msg)
+
 def works(x):
     return os.system(x + " >/dev/null 2>/dev/null") == 0
 
@@ -166,31 +174,41 @@ def unsup_event(e, table, min_kernel=None):
         return False
     return False
 
-def needed_limited_counter(evlist, limit_table, limit_set):
-    limited_only = set(evlist) & set(limit_set)
-    assigned = Counter([limit_table[x] for x in limited_only]).values()
+def remove_qual(ev):
+    return re.sub(r':[ku]', '', re.sub(r'/[ku+]', '/', ev))
+
+def fixed_overflow(evlist):
+    assigned = Counter([fixed_to_num[x] for x in evlist if x in fixed_to_num]).values()
+    return any([x > 1 for x in assigned])
+
+def is_limited(x):
+    return x.startswith("cpu/cycles-ct/")
+
+def limit_overflow(evlist):
+    assigned = Counter([limited_counters[x] for x in evlist if is_limited(x)]).values()
     # 0..1 counter is ok
     # >1   counter is over subscribed
     return sum([x - 1 for x in assigned if x > 1])
 
-def fixed_overflow(evlist):
-    return needed_limited_counter(evlist, fixed_to_num, ingroup_events)
-
-def limit_overflow(evlist):
-    return needed_limited_counter(evlist, limited_counters, limited_set)
-
 # limited to first four counters
-def limit4_set_overflow(evlist):
-    limit4 = [x for x in evlist if fnmatch.fnmatch(x, "cpu/event=0xd[0123],*")]
-    return len(limit4)
+def limit4_overflow(evlist):
+    # hardcoded for ICL (XXX)
+    if cpu.cpu == "icl":
+        limit4 = [x for x in evlist if fnmatch.fnmatch(x, "cpu/event=0xd[0123],*")]
+        return len(limit4)
+    return 0
 
 def needed_counters(evlist):
+    evlist = list(set(evlist)) # remove duplicates first
+    evlist = map(remove_qual, evlist)
     evset = set(evlist)
-    num_generic = len(evset - ingroup_events - limited_set)
+    num = len(evset - ingroup_events)
 
-    # If we need more than 3 fixed counters (happens with any vs no any)
-    # promote those to generic counters
-    num = num_generic + fixed_overflow(evlist)
+    # force split if we overflow fixed or limit4
+    # some fixed could be promoted to generic, but that doesn't work
+    # with ref-cycles.
+    if fixed_overflow(evlist) or limit4_overflow(evlist) > 4:
+        return 100
 
     # account events that only schedule on one of the generic counters
 
@@ -204,17 +222,26 @@ def needed_counters(evlist):
     if num_limit > 0:
         num = max(num, cpu.counters) + num_limit
 
-    # force split if we ran out of lower 4 counters
-    if limit4_set_overflow(evlist) > 4:
-        num = 100
-
     return num
 
 def event_group(evlist):
-    e = ",".join(add_filter(evlist))
-    if not args.no_group and 1 < needed_counters(evlist) <= cpu.counters:
-        e = "{%s}" % (e,)
-    return e
+    evlist = add_filter(evlist)
+    # keep uncore events outside groups for now
+    def notuncore(ev):
+        return not ev.startswith("uncore_")
+    l = []
+    while len(evlist) > 0:
+        if not notuncore(evlist[0]):
+            l.append(evlist[0])
+            evlist = evlist[1:]
+            continue
+        g = list(itertools.takewhile(notuncore, evlist))
+        e = ",".join(g)
+        if not args.no_group and needed_counters(g) <= cpu.counters and len(g) > 1:
+            e = "{%s}" % e
+        l.append(e)
+        evlist = evlist[len(g):]
+    return ",".join(l)
 
 def exe_dir():
     d = os.path.dirname(sys.argv[0])
@@ -354,6 +381,7 @@ g.add_argument('--sample-basename', help='Base name of sample perf.data files', 
 p.add_argument('--version', help=argparse.SUPPRESS, action='store_true')
 p.add_argument('--debug', help=argparse.SUPPRESS, action='store_true')
 p.add_argument('--repl', action='store_true', help=argparse.SUPPRESS)
+p.add_argument('--filterquals', help=argparse.SUPPRESS, action='store_true')
 args, rest = p.parse_known_args()
 
 rest = [x for x in rest if x != "--"]
@@ -507,15 +535,15 @@ def raw_event(i, name="", period=False):
         if e is None:
             if i not in notfound_cache:
                 notfound_cache.add(i)
-                print >>sys.stderr, "%s not found" % (i,)
+                print >>sys.stderr, "%s not found" % i
             return "dummy"
         oi = i
         if re.match("^[0-9]", name):
             name = "T" + name
+        if args.filterquals:
+            e.filter_qual()
 	i = e.output(noname=True, name=name, period=period, noexplode=True)
-	# hack for running tl-tester on on client system where cha doesn't have a cmask
-	if i.startswith("uncore_cha") and ",cmask" in i and not ocperf.has_format("cmask", "uncore_cha_0"):
-	    i = i.replace(",cmask=1", "")
+
         emap.update_event(e.output(noname=True), e)
         if e.counter != cpu.standard_counters and not e.counter.startswith("Fixed"):
             # for now use the first counter only to simplify
@@ -1085,14 +1113,22 @@ def lookup_res(res, rev, ev, obj, env, level, referenced, cpuoff, st):
     referenced.add(index)
     #print (ev, level, obj.name), "->", index
     if not args.fast:
-        rmap_ev = event_rmap(rev[index]).lower()
+        try:
+            rmap_ev = event_rmap(rev[index]).lower()
+        except IndexError:
+            warn_once("Not enough lines perf output. Missing -- in command line?")
+            return make_uval(0)
         ev = ev.lower()
         assert (rmap_ev == canon_event(ev).replace("/k", "/") or
                 compare_event(rmap_ev, ev) or
                 (ev in event_fixes and canon_event(event_fixes[ev]) == rmap_ev) or
                 rmap_ev == "dummy")
 
-    vv = res[index]
+    try:
+        vv = res[index]
+    except IndexError:
+        warn_once("Not enough lines perf output. Missing -- in command line?")
+        return make_uval(0)
     if isinstance(vv, types.TupleType):
         if cpuoff == -1:
             vv = sum(vv)
@@ -1453,7 +1489,7 @@ class Runner:
 
     def add(self, objl, evnum, evlev, force=False):
         # does not fit into a group.
-        if needed_counters(evnum) > cpu.counters and not force:
+        if needed_counters(list(set(evnum))) > cpu.counters and not force:
             self.split_groups(objl, evlev)
             return
         evnum, evlev = dedup2(evnum, evlev)
@@ -1731,7 +1767,7 @@ def sysctl(name):
     return val
 
 # check nmi watchdog
-if sysctl("kernel.nmi_watchdog") != 0:
+if sysctl("kernel.nmi_watchdog") != 0 or os.getenv("FORCE_NMI_WATCHDOG"):
     cpu.counters -= 1
     print >>sys.stderr, "Consider disabling nmi watchdog"
     print >>sys.stderr, "(echo 0 > /proc/sys/kernel/nmi_watchdog as root)"
