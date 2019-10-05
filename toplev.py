@@ -375,7 +375,7 @@ g = p.add_argument_group('Sampling')
 g.add_argument('--show-sample', help='Show command line to rerun workload with sampling', action='store_true')
 g.add_argument('--run-sample', help='Automatically rerun workload with sampling', action='store_true')
 g.add_argument('--sample-args', help='Extra rguments to pass to perf record for sampling. Use + to specify -', default='-g')
-g.add_argument('--sample-repeat', help='Repeat measurement and sampling N times. This interleaves counting and sampling', type=int)
+g.add_argument('--sample-repeat', help='Repeat measurement and sampling N times. This interleaves counting and sampling. Useful for background collection with -a sleep X.', type=int)
 g.add_argument('--sample-basename', help='Base name of sample perf.data files', default="perf.data")
 
 p.add_argument('--version', help=argparse.SUPPRESS, action='store_true')
@@ -452,6 +452,8 @@ def check_ratio(l):
     return 0 - MAX_ERROR < l < 1 + MAX_ERROR
 
 cpu = CPU(known_cpus)
+if cpu.force_hypervisor:
+    feat.has_max_precise = False
 
 def print_perf(r):
     if args.quiet:
