@@ -101,6 +101,9 @@ unsup_events = (
     # commit 3a632cb229b
     ("CYCLE_ACTIVITY.*", (("hsw", "hsx"), (3, 11), None)))
 
+event_nocheck = False
+import_mode = False
+
 errata_whitelist = []
 
 ingroup_events = frozenset(fixed_to_num.keys())
@@ -149,10 +152,15 @@ class PerfFeatures:
             sys.exit("perf binary is too old or perf is disabled in /proc/sys/kernel/perf_event_paranoid")
         self.supports_power = works(perf + " list  | grep -q power/")
         # guests don't support offcore response
-        self.supports_ocr = works(perf + " stat -e '{cpu/event=0xb7,umask=1,offcore_rsp=0x123/,instructions}' true")
-        self.has_max_precise = os.path.exists("/sys/devices/cpu/caps/max_precise")
-        if self.has_max_precise:
-            self.max_precise = int(open("/sys/devices/cpu/caps/max_precise").read())
+        if event_nocheck:
+            self.supports_ocr = True
+            self.has_max_precise = True
+            self.max_precise = 3
+        else:
+            self.supports_ocr = works(perf + " stat -e '{cpu/event=0xb7,umask=1,offcore_rsp=0x123/,instructions}' true")
+            self.has_max_precise = os.path.exists("/sys/devices/cpu/caps/max_precise")
+            if self.has_max_precise:
+                self.max_precise = int(open("/sys/devices/cpu/caps/max_precise").read())
 
 def kv_to_key(v):
     return v[0] * 100 + v[1]
@@ -198,7 +206,7 @@ def limit4_overflow(evlist):
         return len(limit4)
     return 0
 
-def needed_counters(evlist):
+def needed_counters(evlist, nolimit=False):
     evlist = list(set(evlist)) # remove duplicates first
     evlist = map(remove_qual, evlist)
     evset = set(evlist)
@@ -207,7 +215,7 @@ def needed_counters(evlist):
     # force split if we overflow fixed or limit4
     # some fixed could be promoted to generic, but that doesn't work
     # with ref-cycles.
-    if fixed_overflow(evlist) or limit4_overflow(evlist) > 4:
+    if not nolimit and (fixed_overflow(evlist) or limit4_overflow(evlist) > 4):
         return 100
 
     # account events that only schedule on one of the generic counters
@@ -219,7 +227,7 @@ def needed_counters(evlist):
     # if we need more than one of a limited counter make it look
     # like it fills the group to limit first before adding them to force
     # a split
-    if num_limit > 0:
+    if num_limit > 0 and not nolimit:
         num = max(num, cpu.counters) + num_limit
 
     return num
@@ -333,10 +341,15 @@ g.add_argument('--tsx', help="Measure TSX metrics", action='store_true')
 g.add_argument('--all', help="Measure everything available", action='store_true')
 g.add_argument('--frequency', help="Measure frequency", action='store_true')
 g.add_argument('--power', help='Display power metrics', action='store_true')
-g.add_argument('--nodes', help='Include or exclude nodes (with + to add, - to remove, comma separated list, wildcards allowed)')
+g.add_argument('--nodes', help='Include or exclude nodes (with + to add, -|^ to remove, comma separated list, wildcards allowed)')
 g.add_argument('--reduced', help='Use reduced server subset of nodes/metrics', action='store_true')
-g.add_argument('--metric-group', help='Add (+) or remove (-) metric groups of metrics, comma separated list.', default=None)
+g.add_argument('--metric-group', help='Add (+) or remove (-|^) metric groups of metrics, comma separated list.', default=None)
+
+g = p.add_argument_group('Query nodes')
+g.add_argument('--list-metrics', help='List all metrics', action='store_true')
+g.add_argument('--list-nodes', help='List all nodes', action='store_true')
 g.add_argument('--list-metric-groups', help='List metric groups', action='store_true')
+g.add_argument('--list-all', help='List every supported node/metric/metricgroup', action='store_true')
 
 g = p.add_argument_group('Workarounds')
 g.add_argument('--no-group', help='Dont use groups', action='store_true')
@@ -345,6 +358,8 @@ g.add_argument('--ignore-errata', help='Do not disable events with errata', acti
 g.add_argument('--handle-errata', help='Disable events with errata', action='store_true')
 
 g = p.add_argument_group('Output')
+g.add_argument('--per-core', help='Aggregate output per core', action='store_true')
+g.add_argument('--per-socket', help='Aggregate output per socket', action='store_true')
 g.add_argument('--no-desc', help='Do not print event descriptions', action='store_true')
 g.add_argument('--desc', help='Force event descriptions', action='store_true')
 g.add_argument('--verbose', '-v', help='Print all results even when below threshold or exceeding boundaries. Note this can result in bogus values, as the TopDown methodology relies on thresholds to correctly characterize workloads.',
@@ -361,6 +376,7 @@ g.add_argument('--long-desc', help='Print long descriptions instead of abbreviat
                 action='store_true')
 g.add_argument('--columns', help='Print CPU output in multiple columns', action='store_true')
 g.add_argument('--summary', help='Print summary at the end. Only useful with -I', action='store_true')
+g.add_argument('--no-area', help='Hide area column', action='store_true')
 g.add_argument('--perf-output', help='Save perf stat output in specified file', type=argparse.FileType('w'))
 
 g = p.add_argument_group('Additional information')
@@ -369,7 +385,6 @@ g.add_argument('--print-group', '-g', help='Print event group assignments',
 g.add_argument('--raw', help="Print raw values", action='store_true')
 g.add_argument('--valcsv', '-V', help='Write raw counter values into CSV file', type=argparse.FileType('w'))
 g.add_argument('--stats', help='Show statistics on what events counted', action='store_true')
-g.add_argument('--detailed', '-d', help=argparse.SUPPRESS, action='store_true')
 
 g = p.add_argument_group('Sampling')
 g.add_argument('--show-sample', help='Show command line to rerun workload with sampling', action='store_true')
@@ -430,9 +445,10 @@ if args.sample_repeat:
 if args.handle_errata:
     args.ignore_errata = False
 
+import_mode = args.__dict__['import'] is not None
+event_nocheck = import_mode # XXX also for print
 print_all = args.verbose # or args.csv
 dont_hide = args.verbose
-detailed_model = (args.level > 1) or args.detailed
 csv_mode = args.csv
 interval_mode = args.interval
 ring_filter = ""
@@ -451,7 +467,7 @@ def check_ratio(l):
         return True
     return 0 - MAX_ERROR < l < 1 + MAX_ERROR
 
-cpu = CPU(known_cpus)
+cpu = CPU(known_cpus, nocheck=event_nocheck)
 if cpu.force_hypervisor:
     feat.has_max_precise = False
 
@@ -468,7 +484,7 @@ def print_perf(r):
 class PerfRun:
     """Control a perf subprocess."""
     def execute(self, r):
-        if args.__dict__['import']:
+        if import_mode:
             self.perf = None
             return open(args.__dict__['import'], 'r')
 
@@ -530,10 +546,10 @@ def raw_event(i, name="", period=False):
             return "dummy"
         if i in fixed_counters:
             return fixed_counters[i]
-        e = emap.getevent(i)
+        e = emap.getevent(i, nocheck=event_nocheck)
         if e is None:
             if i in event_fixes:
-                e = emap.getevent(event_fixes[i])
+                e = emap.getevent(event_fixes[i], nocheck=event_nocheck)
         if e is None:
             if i not in notfound_cache:
                 notfound_cache.add(i)
@@ -590,13 +606,12 @@ def has(obj, name):
 def flatten(x):
     return itertools.chain(*x)
 
-def print_header(work, evlist):
-    evnames0 = [obj.evlist for obj in work]
-    evnames = set(flatten(evnames0))
+def print_header(work):
+    evnames = set(flatten([obj.evlist for obj in work]))
     names = ["%s%s" % (obj.__class__.__name__, ("[%d]" % obj.__class__.level) if has(obj, 'level') else "") for obj in work]
     pwrap(" ".join(names) + ":", 78)
     pwrap(" ".join(map(mark_fixed, evnames)).lower() +
-          " [%d counters]" % (needed_counters(raw_events(evnames))), 75, "  ")
+          " [%d counters]" % (needed_counters(raw_events(evnames), True)), 75, "  ")
 
 def perf_args(evstr, rest):
     add = []
@@ -667,10 +682,16 @@ def key_to_coreid(k):
     x = cpu.cputocore[int(k)]
     return x[0] * 1000 + x[1]
 
+def key_to_socketid(k):
+    return cpu.cputocore[int(k)][0]
+
 def core_fmt(core):
     if cpu.sockets > 1:
         return "S%d-C%d" % (core / 1000, core % 1000,)
     return "C%d" % (core % 1000,)
+
+def socket_fmt(core):
+    return "S%d" % (core / 1000)
 
 def thread_fmt(j):
     return core_fmt(key_to_coreid(j)) + ("-T%d" % cpu.cputothread[int(j)])
@@ -694,41 +715,73 @@ def display_core(cpunum, ignore_thread=False):
 
 def display_keys(runner, keys):
     if len(keys) > 1 and smt_mode:
-        cores = [key_to_coreid(x) for x in keys if int(x) in runner.allowed_threads]
-        threads = map(thread_fmt, runner.allowed_threads)
-        all_cpus = list(set(map(core_fmt, cores) + threads))
+        if args.per_socket:
+            all_cpus = list(set(map(socket_fmt, runner.allowed_threads)))
+        else:
+            cores = [key_to_coreid(x) for x in keys if int(x) in runner.allowed_threads]
+            if not args.per_core:
+                threads = map(thread_fmt, runner.allowed_threads)
+            else:
+                threads = []
+            all_cpus = list(set(map(core_fmt, cores) + threads))
     else:
         all_cpus = keys
     if any(map(package_node, runner.olist)):
         all_cpus += ["S%d" % x for x in range(cpu.sockets)]
     return all_cpus
 
+def verify_rev(rev, cpus_in_core):
+    for k in cpus_in_core[1:]:
+        for ind, o in enumerate(rev[k]):
+            assert o == rev[cpus_in_core[0]][ind]
+        assert len(rev[k]) == len(rev[cpus_in_core[0]])
+
 def print_keys(runner, res, rev, valstats, out, interval, env):
     stat = runner.stat
     out.set_cpus(display_keys(runner, res.keys()))
     if smt_mode:
         printed_cores = set()
+        printed_sockets = set()
         for j in sorted(res.keys()):
             if j != "" and int(j) not in runner.allowed_threads:
                 continue
 
+            sid = key_to_socketid(j)
+            core = key_to_coreid(j)
+            if args.per_core and core in printed_cores:
+                continue
+            if args.per_socket and sid in printed_sockets:
+                continue
+
             runner.reset_thresh()
 
-            # collect counts from all threads of cores as lists
-            # this way the model can access all threads individually
-            core = key_to_coreid(j)
-            cpus = [x for x in res.keys() if key_to_coreid(x) == core]
+            if args.per_socket:
+                if sid in printed_sockets:
+                    continue
+                cpus = [x for x in res.keys() if key_to_socketid(x) == sid]
+            else:
+                cpus = [x for x in res.keys() if key_to_coreid(x) == core]
             combined_res = zip(*[res[x] for x in cpus])
-            st = [deprecated_combine_valstat(z)
+            combined_st = [deprecated_combine_valstat(z)
                   for z in itertools.izip(*[valstats[x] for x in cpus])]
+            env['num_merged'] = len(cpus)
+
+            if args.per_core or args.per_socket:
+                merged_res = combined_res
+                merged_st = combined_st
+            else:
+                merged_res = res[j]
+                merged_st = valstats[j]
 
             # may need to repeat to get stable threshold values
             # in case of mutual dependencies between SMT and non SMT
             # but don't loop forever (?)
             used_stat = stat
             for _ in xrange(3):
-                changed = runner.compute(res[j], rev[j], valstats[j], env, thread_node, used_stat)
-                changed += runner.compute(combined_res, rev[cpus[0]], st, env, core_node, used_stat)
+                changed = runner.compute(merged_res, rev[j], merged_st, env, thread_node, used_stat)
+                if core not in printed_cores:
+                    verify_rev(rev, cpus)
+                    changed += runner.compute(combined_res, rev[cpus[0]], combined_st, env, core_node, used_stat)
                 if changed == 0:
                     break
                 used_stat = None
@@ -737,14 +790,24 @@ def print_keys(runner, res, rev, valstats, out, interval, env):
             bn = find_bn(runner.olist, not_package_node)
 
             # print the SMT aware nodes
-            if core not in printed_cores:
+            if args.per_socket:
+                runner.print_res(out, interval, socket_fmt(core), core_node, bn)
+                printed_sockets.add(sid)
+            else:
                 runner.print_res(out, interval, core_fmt(core), core_node, bn)
                 printed_cores.add(core)
 
             # print the non SMT nodes
             # recompute the nodes so we get up-to-date values
-            runner.print_res(out, interval, thread_fmt(j), thread_node, bn)
+            if args.per_socket:
+                fmt = socket_fmt(int(j))
+            elif args.per_core:
+                fmt = core_fmt(int(j))
+            else:
+                fmt = thread_fmt(j)
+            runner.print_res(out, interval, fmt, thread_node, bn)
     else:
+        env['num_merged'] = 1
         for j in sorted(res.keys()):
             if j != "" and is_number(j) and int(j) not in runner.allowed_threads:
                 continue
@@ -1047,7 +1110,7 @@ fixes = dict(zip(event_fixes.values(), event_fixes.keys()))
 
 def do_event_rmap(e):
     n = canon_event(emap.getperf(e))
-    if emap.getevent(n):
+    if emap.getevent(n, nocheck=event_nocheck):
         return n
     if n.upper() in fixes:
         n = fixes[n.upper()].lower()
@@ -1073,10 +1136,10 @@ def map_fields(obj, fields):
 
 # compare events to handle name aliases
 def compare_event(aname, bname):
-    a = emap.getevent(aname)
+    a = emap.getevent(aname, nocheck=event_nocheck)
     if a is None:
         return False
-    b = emap.getevent(bname)
+    b = emap.getevent(bname, nocheck=event_nocheck)
     if b is None:
         return False
     fields = ('val','event','cmask','edge','inv')
@@ -1104,12 +1167,11 @@ def lookup_res(res, rev, ev, obj, env, level, referenced, cpuoff, st):
         uv = None
         tmp = [ev(lambda ev, level:
                   lookup_res(res, rev, ev, obj, env, level, referenced, off, st), level)
-                  for off in range(cpu.threads)]
+                  for off in xrange(env['num_merged'])]
         if tmp:
             uv = tmp[0]
             for o in tmp[1:]:
                 uv += o
-            uv.name = ev
         return uv
 
     index = obj.res_map[(ev, level, obj.name)]
@@ -1117,10 +1179,12 @@ def lookup_res(res, rev, ev, obj, env, level, referenced, cpuoff, st):
     #print (ev, level, obj.name), "->", index
     if not args.fast:
         try:
-            rmap_ev = event_rmap(rev[index]).lower()
+            r = rev[index]
         except IndexError:
-            warn_once("Not enough lines perf output. Missing -- in command line?")
-            return make_uval(0)
+            warn_once("Not enough lines in perf output for rev (%d vs %d for %s)" %
+                    (index, len(rev), obj.name))
+            return 0
+        rmap_ev = event_rmap(r).lower()
         ev = ev.lower()
         assert (rmap_ev == canon_event(ev).replace("/k", "/") or
                 compare_event(rmap_ev, ev) or
@@ -1130,7 +1194,8 @@ def lookup_res(res, rev, ev, obj, env, level, referenced, cpuoff, st):
     try:
         vv = res[index]
     except IndexError:
-        warn_once("Not enough lines perf output. Missing -- in command line?")
+        warn_once("Not enough lines in perf output for res (%d vs %d for %s)" %
+                (index, len(res), obj.name))
         return make_uval(0)
     if isinstance(vv, types.TupleType):
         if cpuoff == -1:
@@ -1139,9 +1204,12 @@ def lookup_res(res, rev, ev, obj, env, level, referenced, cpuoff, st):
             try:
                 vv = vv[cpuoff]
             except IndexError:
-                print >>sys.stderr, "warning: Partial CPU thread data from perf"
-                return UVal("null", 0)
-    return make_uval(vv, sd=st[index].stddev, mux=st[index].multiplex)
+                warn_once("warning: Partial CPU thread data from perf for %s" %
+                        obj.name)
+                return 0
+    if st[index].stddev or st[index].multiplex:
+        return make_uval(vv, sd=st[index].stddev, mux=st[index].multiplex)
+    return vv
 
 def add_key(k, x, y):
     k[x] = y
@@ -1172,7 +1240,7 @@ class BadEvent:
 
 # XXX check for errata
 def sample_event(e):
-    ev = emap.getevent(e)
+    ev = emap.getevent(e, nocheck=event_nocheck)
     if not ev:
         raise BadEvent(e)
     postfix = ring_filter
@@ -1229,11 +1297,14 @@ def thread_node(obj):
 def count(f, l):
     return len(filter(f, l))
 
+def obj_domain(obj):
+    return obj.domain.replace("Estimated", "est").replace("Calculated", "calc")
+
 def metric_unit(obj):
     if has(obj, 'unit'):
         return obj.unit
     if has(obj, 'domain'):
-        return obj.domain
+        return obj_domain(obj).replace("SystemMetric", "SysMetric")
     return "Metric"
 
 # only check direct children, the rest are handled recursively
@@ -1241,9 +1312,9 @@ def children_over(l, obj):
     n = [o.thresh for o in l if 'parent' in o.__dict__ and o.parent == obj]
     return any(n)
 
-def obj_desc(obj, rest):
+def obj_desc(obj, rest, force=False):
     # hide description if children are also printed
-    if not args.long_desc and children_over(rest, obj):
+    if not force and not args.long_desc and children_over(rest, obj):
         desc = ""
     else:
         desc = obj.desc[1:].replace("\n", "\n\t")
@@ -1300,7 +1371,10 @@ def find_bn(olist, match):
 
 pmu_does_not_exist = set()
 
+# XXX check if PMU can be accessed from current user
 def missing_pmu(e):
+    if event_nocheck:
+        return False
     m = re.match(r"([a-z0-9_]+)/", e)
     if m:
         pmu = m.group(1)
@@ -1339,8 +1413,10 @@ def olist_by_metricgroup(l, mg):
     return ml
 
 def node_unit(obj):
-    return (((" " + obj.domain) if has(obj, 'domain') else "") +
-             (" below" if not obj.thresh else ""))
+    return (" " + obj_domain(obj)) if has(obj, 'domain') else ""
+
+def node_below(obj):
+    return not obj.thresh
 
 class Summary:
     """Accumulate counts for summary."""
@@ -1368,21 +1444,35 @@ class Summary:
 def parse_metric_group(l, mg):
     if l is None:
         return [], []
+
     add, rem = [], []
     for n in l.split(","):
-        if n[0:1] == '-':
+        if n[0:1] == '-' or n[0:1] == '^':
             if n[1:] not in mg:
-                print "metric group", n[1:], "not found"
+                print >>sys.stderr, "metric group", n[1:], "not found"
                 continue
-            rem += mg[n[1:]]
+            rem += [x.name for x in mg[n[1:]]]
             continue
         if n[0:1] == '+':
             n = n[1:]
         if n not in mg:
-            print "metric group", n, "not found"
+            print >>sys.stderr, "metric group", n, "not found"
             continue
         add += [x.name for x in mg[n]]
     return add, rem
+
+def obj_area(obj):
+    return obj.area if has(obj, 'area') and not args.no_area else None
+
+def get_parents(obj):
+    def get_par(obj):
+        return obj.parent if 'parent' in obj.__dict__ else None
+    p = get_par(obj)
+    l = []
+    while p:
+        l.append(p)
+        p = get_par(p)
+    return l
 
 class Runner:
     """Schedule measurements of event groups. Map events to groups."""
@@ -1392,6 +1482,7 @@ class Runner:
         self.evgroups = list()
         self.evbases = list()
         self.olist = []
+        self.odict = dict()
         self.max_level = max_level
         self.missed = 0
         self.sample_obj = set()
@@ -1410,6 +1501,7 @@ class Runner:
         obj.res = None
         obj.res_map = dict()
         self.olist.append(obj)
+        self.odict[obj.name] = obj
         if has(obj, 'metricgroup'):
             for j in obj.metricgroup:
                 self.metricgroups[j].append(obj)
@@ -1418,14 +1510,24 @@ class Runner:
     def filter_nodes(self):
         add_met, remove_met = parse_metric_group(args.metric_group, self.metricgroups)
 
+        add_obj = set([self.odict[x] for x in add_met])
+        parents = [get_parents(x) for x in add_obj]
+        if add_obj:
+            for o in self.olist:
+                if not has(o, 'sibling') or o.sibling is None:
+                    continue
+                m = set(o.sibling) & add_obj
+                for s in m:
+                    parents.append(s)
+                    parents += get_parents(s)
+
         def want_node(obj):
             if args.reduced and has(obj, 'server') and not obj.server:
                 return False
-            if not obj.metric:
-                return node_filter(obj, obj.level <= self.max_level)
-            else:
-                want = (args.metrics or obj.name in add_met) and not obj.name in remove_met
-                return node_filter(obj, want)
+            want = ((obj.metric and args.metrics) or obj.name in add_met or obj in parents) and not obj.name in remove_met
+            if not obj.metric and obj.level <= self.max_level:
+                want = True
+            return node_filter(obj, want)
 
         self.olist = filter(want_node, self.olist)
 
@@ -1505,7 +1607,7 @@ class Runner:
             self.evgroups.append(evnum)
             self.evbases.append(base)
             if print_group:
-                print_header(objl, get_names(evlev))
+                print_header(objl)
 
     # collect the events by pre-computing the equation
     def collect(self):
@@ -1680,11 +1782,12 @@ class Runner:
 
         # pre compute column lengths
         for obj in olist:
-            out.set_hdr(full_name(obj), obj.area if has(obj, 'area') else None)
+            out.set_hdr(full_name(obj), obj_area(obj))
             if obj.metric:
                 out.set_unit(metric_unit(obj))
             else:
                 out.set_unit(node_unit(obj))
+            out.set_below(node_below(obj))
 
         def get_uval(ob):
             u = ob.val if isinstance(ob.val, UVal) else UVal(ob.name, ob.val)
@@ -1696,27 +1799,32 @@ class Runner:
             val = get_uval(obj)
             desc = obj_desc(obj, olist[i + 1:])
             if obj.metric:
-                out.metric(obj.area if has(obj, 'area') else None,
-                        obj.name, val, timestamp,
+                out.metric(obj_area(obj), obj.name, val, timestamp,
                         desc,
                         title,
                         metric_unit(obj))
-            elif check_ratio(val):
-                out.ratio(obj.area if has(obj, 'area') else None,
+            else:
+                out.ratio(obj_area(obj),
                         full_name(obj), val, timestamp,
-                        node_unit(obj),
+                        "%" + node_unit(obj),
                         desc,
                         title,
                         sample_desc(obj.sample) if has(obj, 'sample') else None,
-                        "<==" if obj == bn else "")
+                        "<==" if obj == bn else "",
+                        node_below(obj))
                 if obj.thresh or args.verbose:
                     self.sample_obj.add(obj)
 
     def list_metric_groups(self):
-        print "MetricGroups: ",
-        for j in self.metricgroups.keys():
-            print j,
-        print
+        print "MetricGroups:"
+        pwrap(" ".join(self.metricgroups.keys()), indent="        ")
+
+    def list_nodes(self, title, filt):
+        print "%s:" % title
+        for obj in self.olist:
+            if filt(obj):
+                print full_name(obj)
+                print "\t",obj_desc(obj, rest=[], force=True)
 
 def supports_pebs():
     if feat.has_max_precise:
@@ -1786,7 +1894,7 @@ def sysctl(name):
 # check nmi watchdog
 if sysctl("kernel.nmi_watchdog") != 0 or os.getenv("FORCE_NMI_WATCHDOG"):
     cpu.counters -= 1
-    print >>sys.stderr, "Consider disabling nmi watchdog"
+    print >>sys.stderr, "Consider disabling nmi watchdog to minimize multiplexing"
     print >>sys.stderr, "(echo 0 > /proc/sys/kernel/nmi_watchdog as root)"
 
 if cpu.cpu is None:
@@ -1880,8 +1988,6 @@ elif cpu.cpu == "knl":
     model = knl_ratios
 else:
     ht_warning()
-    if detailed_model and not args.quiet:
-        print >>sys.stderr, "Sorry, no detailed model for your CPU. Only Level 1 supported."
     import simple_ratios
     model = simple_ratios
 
@@ -1898,14 +2004,15 @@ if "base_frequency" in model.__dict__:
 if "model" in model.__dict__:
     model.model = cpu.modelid
 
-if args.list_metric_groups:
+if args.list_metrics or args.list_all:
+    runner.list_nodes("Metrics", lambda(obj): obj.metric)
+if args.list_nodes or args.list_all:
+    runner.list_nodes("Nodes", lambda(obj): not obj.metric)
+if args.list_metric_groups or args.list_all:
     runner.list_metric_groups()
+if args.list_metric_groups or args.list_metrics or args.list_nodes or args.list_all:
     if len(rest) > 0:
         print >>sys.stderr, "Other arguments ignored"
-    sys.exit(0)
-
-if len(rest) == 0 and not args.__dict__['import']:
-    p.print_help()
     sys.exit(0)
 
 def setup_with_metrics(p, runner):
@@ -1918,10 +2025,6 @@ def check_root():
     if not (os.geteuid() == 0 or sysctl("kernel.perf_event_paranoid") == -1) and not args.quiet:
         print >>sys.stderr, "Warning: Needs root or echo -1 > /proc/sys/kernel/perf_event_paranoid"
 
-if args.nodes:
-    runner.check_nodes(args.nodes)
-runner.filter_nodes()
-
 if not args.no_util:
     import perf_metrics
     setup_with_metrics(perf_metrics, runner)
@@ -1929,7 +2032,7 @@ if not args.no_util:
 if args.power and feat.supports_power:
     import power_metrics
     setup_with_metrics(power_metrics, runner)
-    if not args.quiet:
+    if not args.quiet and not import_mode:
         print "Running with --power. Will measure complete system."
     check_root()
     if "-a" not in rest:
@@ -1950,13 +2053,17 @@ if args.frequency:
     frequency.SetupCPU(runner, cpu)
     args.metrics = old_metrics
 
-if smt_mode and "--per-socket" in rest:
-    sys.exit("toplev not compatible with --per-socket")
-if smt_mode and "--per-core" in rest:
-    sys.exit("toplev not compatible with --per-core")
+if args.nodes:
+    runner.check_nodes(args.nodes)
+runner.filter_nodes()
+
+if args.per_socket and not smt_mode:
+    rest = ["--per-socket"] + rest
+if args.per_core and not smt_mode:
+    rest = ["--per-core"] + rest
 
 if not args.single_thread and cpu.ht:
-    if not args.quiet:
+    if not args.quiet and not import_mode:
         print "Will measure complete system."
     if smt_mode:
         if args.cpu:
