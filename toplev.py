@@ -14,7 +14,7 @@
 # Measure a workload using the topdown performance model:
 # estimate on which part of the CPU pipeline it bottlenecks.
 #
-# Must find ocperf in python module path. add to paths below if needed.
+# Must find ocperf in python module path.
 # Handles a variety of perf and kernel versions, but older ones have various
 # limitations.
 
@@ -65,7 +65,7 @@ unsup_pebs = (
 )
 
 ivb_ht_39 = (("ivb", "ivt"), (4, 1), (3, 9))
-# uncomment if you removed commit 741a698f420c3
+# uncomment if you removed commit 741a698f420c3 from kernel
 #ivb_ht_39 = ((), None, None)
 
 # both kernel bugs and first time a core was supported
@@ -322,7 +322,7 @@ g.add_argument('--no-multiplex',
                action='store_true')
 g.add_argument('--single-thread', '-S', help='Measure workload as single thread. Workload must run single threaded. In SMT mode other thread must be idle.', action='store_true')
 g.add_argument('--fast', '-F', help='Skip sanity checks to optimize CPU consumption', action='store_true')
-g.add_argument('--import', help='Import specified perf stat output file instead of running perf')
+g.add_argument('--import', help='Import specified perf stat output file instead of running perf', dest='_import')
 
 g = p.add_argument_group('Measurement filtering')
 g.add_argument('--kernel', help='Only measure kernel code', action='store_true')
@@ -360,13 +360,16 @@ g.add_argument('--handle-errata', help='Disable events with errata', action='sto
 g = p.add_argument_group('Output')
 g.add_argument('--per-core', help='Aggregate output per core', action='store_true')
 g.add_argument('--per-socket', help='Aggregate output per socket', action='store_true')
+g.add_argument('--per-thread', help='Aggregate output per CPU thread', action='store_true')
+g.add_argument('--global', help='Aggregate output for all CPUs', action='store_true', dest='_global')
 g.add_argument('--no-desc', help='Do not print event descriptions', action='store_true')
 g.add_argument('--desc', help='Force event descriptions', action='store_true')
 g.add_argument('--verbose', '-v', help='Print all results even when below threshold or exceeding boundaries. Note this can result in bogus values, as the TopDown methodology relies on thresholds to correctly characterize workloads.',
                action='store_true')
 g.add_argument('--csv', '-x', help='Enable CSV mode with specified delimeter')
-g.add_argument('--output', '-o', help='Set output file', default=sys.stderr,
-               type=argparse.FileType('w'))
+g.add_argument('--output', '-o', help='Set output file')
+g.add_argument('--split-output', help='Generate multiple output files, one for each specified aggregation option (with -o)',
+               action='store_true')
 g.add_argument('--graph', help='Automatically graph interval output with tl-barplot.py',
                action='store_true')
 g.add_argument("--graph-cpu", help="CPU to graph using --graph")
@@ -429,8 +432,10 @@ if args.graph:
     else:
         title = "cpu %s" % (args.graph_cpu if args.graph_cpu else 0)
     extra += '--title "' + title + '" '
-    if args.output != sys.stderr:
-        extra += '--output "' + args.output.name + '" '
+    if args.split_output:
+        sys.exit("--split-output not allowed with --graph")
+    if args.output != "":
+        extra += '--output "' + args.output + '" '
     if args.graph_cpu:
         extra += "--cpu " + args.graph_cpu + " "
     args.csv = ','
@@ -445,7 +450,7 @@ if args.sample_repeat:
 if args.handle_errata:
     args.ignore_errata = False
 
-import_mode = args.__dict__['import'] is not None
+import_mode = args._import is not None
 event_nocheck = import_mode # XXX also for print
 print_all = args.verbose # or args.csv
 dont_hide = args.verbose
@@ -486,7 +491,7 @@ class PerfRun:
     def execute(self, r):
         if import_mode:
             self.perf = None
-            return open(args.__dict__['import'], 'r')
+            return open(args._import, 'r')
 
         outp, inp = pty.openpty()
         n = r.index("--log-fd")
@@ -690,8 +695,8 @@ def core_fmt(core):
         return "S%d-C%d" % (core / 1000, core % 1000,)
     return "C%d" % (core % 1000,)
 
-def socket_fmt(core):
-    return "S%d" % (core / 1000)
+def socket_fmt(j):
+    return "S%d" % cpu.cputocore[j][0]
 
 def thread_fmt(j):
     return core_fmt(key_to_coreid(j)) + ("-T%d" % cpu.cputothread[int(j)])
@@ -713,7 +718,9 @@ def display_core(cpunum, ignore_thread=False):
         return True
     return False
 
-def display_keys(runner, keys):
+def display_keys(runner, keys, args):
+    if args._global:
+        return ("",)
     if len(keys) > 1 and smt_mode:
         if args.per_socket:
             all_cpus = list(set(map(socket_fmt, runner.allowed_threads)))
@@ -730,15 +737,15 @@ def display_keys(runner, keys):
         all_cpus += ["S%d" % x for x in range(cpu.sockets)]
     return all_cpus
 
-def verify_rev(rev, cpus_in_core):
-    for k in cpus_in_core[1:]:
+def verify_rev(rev, cpus):
+    for k in cpus:
         for ind, o in enumerate(rev[k]):
-            assert o == rev[cpus_in_core[0]][ind]
-        assert len(rev[k]) == len(rev[cpus_in_core[0]])
+            assert o == rev[cpus[0]][ind]
+        assert len(rev[k]) == len(rev[cpus[0]])
 
-def print_keys(runner, res, rev, valstats, out, interval, env):
+def print_keys(runner, res, rev, valstats, out, interval, env, args):
     stat = runner.stat
-    out.set_cpus(display_keys(runner, res.keys()))
+    out.set_cpus(display_keys(runner, res.keys(), args))
     if smt_mode:
         printed_cores = set()
         printed_sockets = set()
@@ -755,9 +762,9 @@ def print_keys(runner, res, rev, valstats, out, interval, env):
 
             runner.reset_thresh()
 
-            if args.per_socket:
-                if sid in printed_sockets:
-                    continue
+            if args._global:
+                cpus = res.keys()
+            elif args.per_socket:
                 cpus = [x for x in res.keys() if key_to_socketid(x) == sid]
             else:
                 cpus = [x for x in res.keys() if key_to_coreid(x) == core]
@@ -766,7 +773,7 @@ def print_keys(runner, res, rev, valstats, out, interval, env):
                   for z in itertools.izip(*[valstats[x] for x in cpus])]
             env['num_merged'] = len(cpus)
 
-            if args.per_core or args.per_socket:
+            if args.per_core or args.per_socket or args._global:
                 merged_res = combined_res
                 merged_st = combined_st
             else:
@@ -789,22 +796,29 @@ def print_keys(runner, res, rev, valstats, out, interval, env):
             # find bottleneck
             bn = find_bn(runner.olist, not_package_node)
 
-            # print the SMT aware nodes
+            if args._global:
+                runner.print_res(out, interval, "", not_package_node, bn)
+                break
             if args.per_socket:
-                runner.print_res(out, interval, socket_fmt(core), core_node, bn)
+                runner.print_res(out, interval, socket_fmt(int(j)), not_package_node, bn)
                 printed_sockets.add(sid)
-            else:
+                continue
+            if args.per_thread:
+                runner.print_res(out, interval, thread_fmt(int(j)), any_node, bn)
+                continue
+
+            # per core or mixed core/thread mode
+
+            # print the SMT aware nodes
+            if core not in printed_cores:
                 runner.print_res(out, interval, core_fmt(core), core_node, bn)
                 printed_cores.add(core)
 
             # print the non SMT nodes
-            # recompute the nodes so we get up-to-date values
-            if args.per_socket:
-                fmt = socket_fmt(int(j))
-            elif args.per_core:
-                fmt = core_fmt(int(j))
+            if args.per_core:
+                fmt = core_fmt(core)
             else:
-                fmt = thread_fmt(j)
+                fmt = thread_fmt(int(j))
             runner.print_res(out, interval, fmt, thread_node, bn)
     else:
         env['num_merged'] = 1
@@ -814,38 +828,77 @@ def print_keys(runner, res, rev, valstats, out, interval, env):
             runner.compute(res[j], rev[j], valstats[j], env, not_package_node, stat)
             bn = find_bn(runner.olist, not_package_node)
             runner.print_res(out, interval, j, not_package_node, bn)
-    packages = set()
-    for j in sorted(res.keys()):
-        if j == "":
-            continue
-        if is_number(j):
-            if int(j) not in runner.allowed_threads:
+    if args._global:
+        cpus = [x for x in res.keys()
+                if (not is_number(j)) or int(j) in runner.allowed_threads]
+        combined_res = [sum([res[j][i] for j in cpus])
+                        for i in xrange(len(res[cpus[0]]))]
+        combined_st = [deprecated_combine_valstat([valstats[j][i] for j in cpus])
+                       for i in xrange(len(valstats[cpus[0]]))]
+        runner.compute(combined_res, rev[cpus[0]], combined_st, env, package_node, stat)
+        runner.print_res(out, interval, "", package_node, None)
+    elif not args.per_thread:
+        packages = set()
+        for j in sorted(res.keys()):
+            if j == "":
                 continue
-            p_id = cpu.cputosocket[int(j)]
-            if p_id in packages:
-                continue
-            packages.add(p_id)
-            jname = "S%d" % p_id
-        else:
-            jname = j
-        runner.compute(res[j], rev[j], valstats[j], env, package_node, stat)
-        runner.print_res(out, interval, jname, package_node, None)
-        # no bottlenecks from package nodes for now
+            if is_number(j):
+                if int(j) not in runner.allowed_threads:
+                    continue
+                p_id = cpu.cputosocket[int(j)]
+                if p_id in packages:
+                    continue
+                packages.add(p_id)
+                jname = "S%d" % p_id
+            else:
+                jname = j
+            runner.compute(res[j], rev[j], valstats[j], env, package_node, stat)
+            runner.print_res(out, interval, jname, package_node, None)
+    # no bottlenecks from package nodes for now
     out.flush()
     stat.referenced_check(res)
     stat.compute_errors()
 
+class DummyArgs:
+    def __init__(self, d):
+        self.per_thread = False
+        self.per_core = False
+        self.per_socket = False
+        self._global = False
+        self.__dict__.update(d)
+
+def print_and_split_keys(runner, res, rev, valstats, out, interval, env):
+    if args.per_core + args.per_thread + args.per_socket + args._global > 1:
+        if args.per_thread:
+            out.remark("Per thread")
+            out.reset("thread")
+            print_keys(runner, res, rev, valstats, out, interval, env, DummyArgs({'per_thread': True}))
+        if args.per_core:
+            out.remark("Per core")
+            out.reset("core")
+            print_keys(runner, res, rev, valstats, out, interval, env, DummyArgs({'per_core': True}))
+        if args.per_socket:
+            out.remark("Per socket")
+            out.reset("socket")
+            print_keys(runner, res, rev, valstats, out, interval, env, DummyArgs({'per_socket': True}))
+        if args._global:
+            out.remark("Global")
+            out.reset("global")
+            print_keys(runner, res, rev, valstats, out, interval, env, DummyArgs({'_global': True}))
+    else:
+        print_keys(runner, res, rev, valstats, out, interval, env, args)
+
 def print_and_sum_keys(runner, res, rev, valstats, out, interval, env):
     if runner.summary:
         runner.summary.add(res, rev, valstats, env);
-    print_keys(runner, res, rev, valstats, out, interval, env)
+    print_and_split_keys(runner, res, rev, valstats, out, interval, env)
 
 def print_summary(runner, out):
     if not args.summary:
         return
-    print_keys(runner, runner.summary.res, runner.summary.rev,
-               runner.summary.valstats, out,
-               float('nan'), runner.summary.env)
+    print_and_split_keys(runner, runner.summary.res, runner.summary.rev,
+                         runner.summary.valstats, out,
+                         float('nan'), runner.summary.env)
 
 def is_outgroup(x):
     return set(x) - outgroup_events == set()
@@ -917,16 +970,16 @@ def group_number(num, events):
     gnums = map(group_nums, events)
     return list(flatten(gnums))[num]
 
-def dump_raw(interval, title, event, val, index, events, stddev, multiplex):
+def dump_raw(interval, title, event, val, index, events, stddev, multiplex, nodes):
     if event in fixed_to_name:
         ename = fixed_to_name[event].lower()
     else:
         ename = event_rmap(event)
     gnum = group_number(index, events)
     if args.raw:
-        print "raw", title, "event", event, "val", val, "ename", ename, "index", index, "group", gnum
+        print "raw", title, "event", event, "val", val, "ename", ename, "index", index, "group", gnum, "nodes", nodes
     if args.valcsv:
-        runner.valcsv.writerow((interval, title, gnum, ename, val, event, index, stddev, multiplex))
+        runner.valcsv.writerow((interval, title, gnum, ename, val, event, index, stddev, multiplex, nodes))
 
 perf_fields = [
     r"[0-9.]+",
@@ -1057,7 +1110,8 @@ def do_execute(runner, events, out, rest, res, rev, valstats, env):
         # unless we use -A ??
         # also -C xxx causes them to be duplicated too, unless single thread
 	if (re.match(r'power|uncore', event) and
-                title != "" and (not (args.core and not args.single_thread))):
+                title != "" and is_number(title) and
+                (not (args.core and not args.single_thread))):
             cpunum = int(title)
             socket = cpu.cputosocket[cpunum]
             for j in cpu.sockettocpus[socket]:
@@ -1075,7 +1129,8 @@ def do_execute(runner, events, out, rest, res, rev, valstats, env):
                      event,
                      val,
                      len(res[title]) - len(init_res[title]) - 1,
-                     events, stddev, multiplex)
+                     events, stddev, multiplex,
+                     " ".join([o.name.replace(" ", "_") for o in runner.indexobj[len(res[title]) - 1]]))
     inf.close()
     if 'interval-s' not in env:
             set_interval(env, time.time() - start)
@@ -1294,6 +1349,9 @@ def thread_node(obj):
         return False
     return True
 
+def any_node(obj):
+    return True
+
 def count(f, l):
     return len(filter(f, l))
 
@@ -1492,10 +1550,11 @@ class Runner:
         if args.valcsv:
             self.valcsv = csv.writer(args.valcsv)
             self.valcsv.writerow(("Timestamp", "CPU" ,"Group", "Event", "Value",
-                                  "Perf-event", "Index", "STDEV", "MULTI"))
+                                  "Perf-event", "Index", "STDDEV", "MULTI", "Nodes"))
         self.summary = None
         if args.summary:
             self.summary = Summary()
+        self.indexobj = None
 
     def do_run(self, obj):
         obj.res = None
@@ -1708,6 +1767,8 @@ class Runner:
                 len(set(self.evnum)),
                 len(self.olist),
                 self.missed)
+        if args.valcsv or args.raw:
+            self.gen_indexobj()
 
     def propagate_siblings(self):
         changed = [0]
@@ -1763,7 +1824,8 @@ class Runner:
         return changed
 
     def print_res(self, out, timestamp, title, match, bn):
-        out.logf.flush()
+        if has(out, 'logf') and out.logf == sys.stderr:
+            out.logf.flush()
 
         # determine all objects to print
         olist = []
@@ -1814,6 +1876,12 @@ class Runner:
                         node_below(obj))
                 if obj.thresh or args.verbose:
                     self.sample_obj.add(obj)
+
+    def gen_indexobj(self):
+        self.indexobj = defaultdict(list)
+        for o in self.olist:
+            for n in o.res_map.values():
+                self.indexobj[n].append(o)
 
     def list_metric_groups(self):
         print "MetricGroups:"
@@ -2061,6 +2129,8 @@ if args.per_socket and not smt_mode:
     rest = ["--per-socket"] + rest
 if args.per_core and not smt_mode:
     rest = ["--per-core"] + rest
+if (args._global or args.per_socket or args.per_core) and not smt_mode:
+    rest = ["-a"] + rest
 
 if not args.single_thread and cpu.ht:
     if not args.quiet and not import_mode:
