@@ -5,6 +5,7 @@
 # for non root set kernel.perf_event_paranoid = -1
 
 set -e
+set -o pipefail
 
 WRAP=${WRAP:-}
 
@@ -28,7 +29,7 @@ EOL
 
 set -x
 
-LOAD="${LOAD:--- gcc -o /dev/null hello.c}"
+LOAD="${LOAD:--- gcc -O3 -o /dev/null hello.c}"
 LOAD0="-- taskset -c 0 $LOAD"
 
 set -o pipefail
@@ -105,7 +106,7 @@ checklog() {
 
 for j in $SMTCPUS ; do
 if ! grep -q hypervisor /proc/cpuinfo ; then
-TOPOLOGY=topology EVENTMAP=${cpus[$j]} UNCORE=${cpus[$j]} FORCEHT=1 FORCECPU=$j $WRAP ./toplev.py --force-events -l1 --filterquals $LOAD 2>&1 | tee log.$j
+EVENTMAP=${cpus[$j]} UNCORE=${cpus[$j]} FORCEHT=1 FORCECPU=$j $WRAP ./toplev.py --force-topology topology --force-events -l1 --filterquals $LOAD 2>&1 | tee log.$j
 [ $j != "knl" ] && onegroup log.$j
 checklog log.$j
 egrep "not found|missing" log.$j >> nflog || true
@@ -140,12 +141,14 @@ done
 EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py -o log$$ --ignore-errata --stats --metrics --force-events --no-multiplex -l4 $LOAD
 grep Turbo_Utilization log$$
 rm log$$
-EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py --all --fast $LOAD
+EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py -o log$$ --all --fast $LOAD
+grep Turbo_Utilization log$$
+rm log$$
 EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py --perf-output x$$.csv --all $LOAD
 EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py --import x$$.csv --all
 rm x$$.csv
 EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py --stats --metrics --no-multiplex --columns -l4 $LOAD
-EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py --stats --metrics --per-core --columns -l4 $LOAD
+$WRAP ./toplev.py --force-cpu bdw --no-check --force-cpuinfo bdw-cpuinfo --stats --metrics --per-core --columns -l4 $LOAD
 EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py --stats --metrics --per-socket --columns -l4 $LOAD
 EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py --stats --metrics --per-thread --columns -l4 $LOAD
 EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py --stats --metrics --per-thread -x, --columns -l4 $LOAD
@@ -168,6 +171,8 @@ onegroup log$$
 grep :u log$$
 grep /u log$$
 EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py --list-all
+EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py --no-uncore $LOAD
+$WRAP ./toplev.py --force-hypervisor --force-cpu hsw $LOAD
 EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py --metric-group +TopDownL1,TLB $LOAD
 if python -c 'import matplotlib.pyplot' ; then
 EVENTMAP=${cpus[hsw]} FORCECPU=hsw $WRAP ./toplev.py --graph -o x.png --metrics -l4 $LOAD

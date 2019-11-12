@@ -23,7 +23,7 @@ import exceptions, argparse, time, types, fnmatch, csv, copy
 from collections import defaultdict, Counter
 
 from tl_stat import ComputeStat, ValStat, deprecated_combine_valstat
-from tl_cpu import CPU
+import tl_cpu
 import tl_output
 import ocperf
 from tl_uval import UVal, combine_uval
@@ -146,11 +146,14 @@ def works(x):
 
 class PerfFeatures:
     """Adapt to the quirks of various perf versions."""
-    def __init__(self):
+    def __init__(self, args):
         self.logfd_supported = works(perf + " stat --log-fd 3 3>/dev/null true")
         if not self.logfd_supported:
             sys.exit("perf binary is too old or perf is disabled in /proc/sys/kernel/perf_event_paranoid")
-        self.supports_power = works(perf + " list  | grep -q power/")
+        self.supports_power = (
+                not args.no_uncore
+                and not args.force_hypervisor
+                and works(perf + " list  | grep -q power/"))
         # guests don't support offcore response
         if event_nocheck:
             self.supports_ocr = True
@@ -257,11 +260,6 @@ def exe_dir():
         return d
     return "."
 
-feat = PerfFeatures()
-emap = ocperf.find_emap()
-if not emap:
-    sys.exit("Unknown CPU or CPU event map not found.")
-
 p = argparse.ArgumentParser(usage='toplev [options] perf-arguments',
 description='''
 Estimate on which part of the CPU pipeline a workload bottlenecks using the TopDown model.
@@ -322,7 +320,7 @@ g.add_argument('--no-multiplex',
                action='store_true')
 g.add_argument('--single-thread', '-S', help='Measure workload as single thread. Workload must run single threaded. In SMT mode other thread must be idle.', action='store_true')
 g.add_argument('--fast', '-F', help='Skip sanity checks to optimize CPU consumption', action='store_true')
-g.add_argument('--import', help='Import specified perf stat output file instead of running perf', dest='_import')
+g.add_argument('--import', help='Import specified perf stat output file instead of running perf. Must be for same cpu, same arguments, same /proc/cpuinfo', dest='_import')
 
 g = p.add_argument_group('Measurement filtering')
 g.add_argument('--kernel', help='Only measure kernel code', action='store_true')
@@ -332,7 +330,7 @@ g.add_argument('--pid', '-p', help=argparse.SUPPRESS)
 g.add_argument('--core', help='Limit output to cores. Comma list of Sx-Cx-Tx. All parts optional.')
 
 g = p.add_argument_group('Select events')
-g.add_argument('--level', '-l', help='Measure upto level N (max 5)',
+g.add_argument('--level', '-l', help='Measure upto level N (max 6)',
                type=int, default=1)
 g.add_argument('--metrics', '-m', help="Print extra metrics", action='store_true')
 g.add_argument('--sw', help="Measure perf Linux metrics", action='store_true')
@@ -343,7 +341,7 @@ g.add_argument('--frequency', help="Measure frequency", action='store_true')
 g.add_argument('--power', help='Display power metrics', action='store_true')
 g.add_argument('--nodes', help='Include or exclude nodes (with + to add, -|^ to remove, comma separated list, wildcards allowed)')
 g.add_argument('--reduced', help='Use reduced server subset of nodes/metrics', action='store_true')
-g.add_argument('--metric-group', help='Add (+) or remove (-|^) metric groups of metrics, comma separated list.', default=None)
+g.add_argument('--metric-group', help='Add (+) or remove (-|^) metric groups of metrics, comma separated list from --list-metric-groups.', default=None)
 
 g = p.add_argument_group('Query nodes')
 g.add_argument('--list-metrics', help='List all metrics', action='store_true')
@@ -377,10 +375,18 @@ g.add_argument('--title', help='Set title of graph')
 g.add_argument('--quiet', help='Avoid unnecessary status output', action='store_true')
 g.add_argument('--long-desc', help='Print long descriptions instead of abbreviated ones.',
                 action='store_true')
-g.add_argument('--columns', help='Print CPU output in multiple columns', action='store_true')
+g.add_argument('--columns', help='Print CPU output in multiple columns for each node', action='store_true')
 g.add_argument('--summary', help='Print summary at the end. Only useful with -I', action='store_true')
 g.add_argument('--no-area', help='Hide area column', action='store_true')
 g.add_argument('--perf-output', help='Save perf stat output in specified file', type=argparse.FileType('w'))
+
+g = p.add_argument_group('Environment')
+g.add_argument('--force-cpu', help='Force CPU type', choices=[x[0] for x in known_cpus if not x[0] == "simple"])
+g.add_argument('--force-topology', metavar='findsysoutput', help='Use specified topology file (find /sys/devices)')
+g.add_argument('--force-cpuinfo', metavar='cpuinfo', help='Use specified cpuinfo file (/proc/cpuinfo)')
+g.add_argument('--force-hypervisor', help='Assume running under hypervisor (no uncore, no offcore, no PEBS)', action='store_true')
+g.add_argument('--no-uncore', help='Disable uncore events', action='store_true')
+g.add_argument('--no-check', help='Do not check that PMU units exist', action='store_true')
 
 g = p.add_argument_group('Additional information')
 g.add_argument('--print-group', '-g', help='Print event group assignments',
@@ -401,6 +407,11 @@ p.add_argument('--debug', help=argparse.SUPPRESS, action='store_true')
 p.add_argument('--repl', action='store_true', help=argparse.SUPPRESS)
 p.add_argument('--filterquals', help=argparse.SUPPRESS, action='store_true')
 args, rest = p.parse_known_args()
+
+feat = PerfFeatures(args)
+emap = ocperf.find_emap()
+if not emap:
+    sys.exit("Unknown CPU or CPU event map not found.")
 
 rest = [x for x in rest if x != "--"]
 
@@ -434,7 +445,7 @@ if args.graph:
     extra += '--title "' + title + '" '
     if args.split_output:
         sys.exit("--split-output not allowed with --graph")
-    if args.output != "":
+    if args.output:
         extra += '--output "' + args.output + '" '
     if args.graph_cpu:
         extra += "--cpu " + args.graph_cpu + " "
@@ -451,7 +462,7 @@ if args.handle_errata:
     args.ignore_errata = False
 
 import_mode = args._import is not None
-event_nocheck = import_mode # XXX also for print
+event_nocheck = import_mode or args.no_check # XXX also for print
 print_all = args.verbose # or args.csv
 dont_hide = args.verbose
 csv_mode = args.csv
@@ -472,9 +483,37 @@ def check_ratio(l):
         return True
     return 0 - MAX_ERROR < l < 1 + MAX_ERROR
 
-cpu = CPU(known_cpus, nocheck=event_nocheck)
-if cpu.force_hypervisor:
-    feat.has_max_precise = False
+def gen_cpu_name(cpu):
+    for j in known_cpus:
+        if cpu == j[0]:
+            if isinstance(j[1][0], int):
+                return "GenuineIntel-6-%02X" % j[1][0]
+            return "GenuineIntel-6-%02X-%02X" % j[1][0]
+    assert False
+
+env = tl_cpu.Env()
+
+if args.force_cpu:
+    env.forcecpu = args.force_cpu
+    if not os.getenv("EVENTMAP"):
+        os.putenv("EVENTMAP", gen_cpu_name(args.force_cpu))
+if args.force_topology:
+    if not os.getenv("TOPOLOGY"):
+        os.putenv("TOPOLOGY", args.force_topology)
+if args.force_cpuinfo:
+    env.cpuinfo = args.force_cpuinfo
+if args.force_hypervisor:
+    env.hypervisor = True
+
+cpu = tl_cpu.CPU(known_cpus, nocheck=event_nocheck, env=env)
+
+if cpu.hypervisor:
+    feat.max_precise = 0
+    feat.has_max_precise = True
+    feat.supports_ocr = False
+
+if cpu.hypervisor or args.no_uncore:
+    feat.supports_power = False
 
 def print_perf(r):
     if args.quiet:
@@ -718,15 +757,21 @@ def display_core(cpunum, ignore_thread=False):
         return True
     return False
 
-def display_keys(runner, keys, args):
-    if args._global:
+OUTPUT_CORE_THREAD = 0
+OUTPUT_CORE = 1
+OUTPUT_THREAD = 2
+OUTPUT_SOCKET = 3
+OUTPUT_GLOBAL = 4
+
+def display_keys(runner, keys, mode):
+    if mode == OUTPUT_GLOBAL:
         return ("",)
     if len(keys) > 1 and smt_mode:
-        if args.per_socket:
+        if mode == OUTPUT_SOCKET:
             all_cpus = list(set(map(socket_fmt, runner.allowed_threads)))
         else:
             cores = [key_to_coreid(x) for x in keys if int(x) in runner.allowed_threads]
-            if not args.per_core:
+            if mode != OUTPUT_CORE:
                 threads = map(thread_fmt, runner.allowed_threads)
             else:
                 threads = []
@@ -743,9 +788,9 @@ def verify_rev(rev, cpus):
             assert o == rev[cpus[0]][ind]
         assert len(rev[k]) == len(rev[cpus[0]])
 
-def print_keys(runner, res, rev, valstats, out, interval, env, args):
+def print_keys(runner, res, rev, valstats, out, interval, env, mode):
     stat = runner.stat
-    out.set_cpus(display_keys(runner, res.keys(), args))
+    out.set_cpus(display_keys(runner, res.keys(), mode))
     if smt_mode:
         printed_cores = set()
         printed_sockets = set()
@@ -755,16 +800,16 @@ def print_keys(runner, res, rev, valstats, out, interval, env, args):
 
             sid = key_to_socketid(j)
             core = key_to_coreid(j)
-            if args.per_core and core in printed_cores:
+            if mode == OUTPUT_CORE and core in printed_cores:
                 continue
-            if args.per_socket and sid in printed_sockets:
+            if mode == OUTPUT_SOCKET and sid in printed_sockets:
                 continue
 
             runner.reset_thresh()
 
-            if args._global:
+            if mode == OUTPUT_GLOBAL:
                 cpus = res.keys()
-            elif args.per_socket:
+            elif mode == OUTPUT_SOCKET:
                 cpus = [x for x in res.keys() if key_to_socketid(x) == sid]
             else:
                 cpus = [x for x in res.keys() if key_to_coreid(x) == core]
@@ -773,7 +818,7 @@ def print_keys(runner, res, rev, valstats, out, interval, env, args):
                   for z in itertools.izip(*[valstats[x] for x in cpus])]
             env['num_merged'] = len(cpus)
 
-            if args.per_core or args.per_socket or args._global:
+            if mode in (OUTPUT_CORE,OUTPUT_SOCKET,OUTPUT_GLOBAL):
                 merged_res = combined_res
                 merged_st = combined_st
             else:
@@ -796,14 +841,14 @@ def print_keys(runner, res, rev, valstats, out, interval, env, args):
             # find bottleneck
             bn = find_bn(runner.olist, not_package_node)
 
-            if args._global:
+            if mode == OUTPUT_GLOBAL:
                 runner.print_res(out, interval, "", not_package_node, bn)
                 break
-            if args.per_socket:
+            if mode == OUTPUT_SOCKET:
                 runner.print_res(out, interval, socket_fmt(int(j)), not_package_node, bn)
                 printed_sockets.add(sid)
                 continue
-            if args.per_thread:
+            if mode == OUTPUT_THREAD:
                 runner.print_res(out, interval, thread_fmt(int(j)), any_node, bn)
                 continue
 
@@ -815,7 +860,7 @@ def print_keys(runner, res, rev, valstats, out, interval, env, args):
                 printed_cores.add(core)
 
             # print the non SMT nodes
-            if args.per_core:
+            if mode == OUTPUT_CORE:
                 fmt = core_fmt(core)
             else:
                 fmt = thread_fmt(int(j))
@@ -828,7 +873,7 @@ def print_keys(runner, res, rev, valstats, out, interval, env, args):
             runner.compute(res[j], rev[j], valstats[j], env, not_package_node, stat)
             bn = find_bn(runner.olist, not_package_node)
             runner.print_res(out, interval, j, not_package_node, bn)
-    if args._global:
+    if mode == OUTPUT_GLOBAL:
         cpus = [x for x in res.keys()
                 if (not is_number(j)) or int(j) in runner.allowed_threads]
         combined_res = [sum([res[j][i] for j in cpus])
@@ -837,7 +882,7 @@ def print_keys(runner, res, rev, valstats, out, interval, env, args):
                        for i in xrange(len(valstats[cpus[0]]))]
         runner.compute(combined_res, rev[cpus[0]], combined_st, env, package_node, stat)
         runner.print_res(out, interval, "", package_node, None)
-    elif not args.per_thread:
+    elif mode != OUTPUT_THREAD:
         packages = set()
         for j in sorted(res.keys()):
             if j == "":
@@ -859,34 +904,35 @@ def print_keys(runner, res, rev, valstats, out, interval, env, args):
     stat.referenced_check(res)
     stat.compute_errors()
 
-class DummyArgs:
-    def __init__(self, d):
-        self.per_thread = False
-        self.per_core = False
-        self.per_socket = False
-        self._global = False
-        self.__dict__.update(d)
-
 def print_and_split_keys(runner, res, rev, valstats, out, interval, env):
     if args.per_core + args.per_thread + args.per_socket + args._global > 1:
         if args.per_thread:
             out.remark("Per thread")
             out.reset("thread")
-            print_keys(runner, res, rev, valstats, out, interval, env, DummyArgs({'per_thread': True}))
+            print_keys(runner, res, rev, valstats, out, interval, env, OUTPUT_THREAD)
         if args.per_core:
             out.remark("Per core")
             out.reset("core")
-            print_keys(runner, res, rev, valstats, out, interval, env, DummyArgs({'per_core': True}))
+            print_keys(runner, res, rev, valstats, out, interval, env, OUTPUT_CORE)
         if args.per_socket:
             out.remark("Per socket")
             out.reset("socket")
-            print_keys(runner, res, rev, valstats, out, interval, env, DummyArgs({'per_socket': True}))
+            print_keys(runner, res, rev, valstats, out, interval, env, OUTPUT_SOCKET)
         if args._global:
             out.remark("Global")
             out.reset("global")
-            print_keys(runner, res, rev, valstats, out, interval, env, DummyArgs({'_global': True}))
+            print_keys(runner, res, rev, valstats, out, interval, env, OUTPUT_GLOBAL)
     else:
-        print_keys(runner, res, rev, valstats, out, interval, env, args)
+        mode = OUTPUT_CORE_THREAD
+        if args.per_thread:
+            mode = OUTPUT_THREAD
+        elif args.per_core:
+            mode = OUTPUT_CORE
+        elif args.per_socket:
+            mode = OUTPUT_SOCKET
+        elif args._global:
+            mode = OUTPUT_GLOBAL
+        print_keys(runner, res, rev, valstats, out, interval, env, mode)
 
 def print_and_sum_keys(runner, res, rev, valstats, out, interval, env):
     if runner.summary:
@@ -1583,6 +1629,8 @@ class Runner:
         def want_node(obj):
             if args.reduced and has(obj, 'server') and not obj.server:
                 return False
+            if args.no_uncore and has(obj, 'domain') and obj.area == "Info.System":
+                return False
             want = ((obj.metric and args.metrics) or obj.name in add_met or obj in parents) and not obj.name in remove_met
             if not obj.metric and obj.level <= self.max_level:
                 want = True
@@ -1818,6 +1866,7 @@ class Runner:
                 if obj.name not in stat.errors:
                     stat.errcount += obj.errcount
                 stat.errors.add(obj.name)
+                stat.referenced |= set(obj.res_map.itervalues())
 
         # step 2: propagate siblings
         changed += self.propagate_siblings()
@@ -2093,6 +2142,10 @@ def check_root():
     if not (os.geteuid() == 0 or sysctl("kernel.perf_event_paranoid") == -1) and not args.quiet:
         print >>sys.stderr, "Warning: Needs root or echo -1 > /proc/sys/kernel/perf_event_paranoid"
 
+if args.nodes:
+    runner.check_nodes(args.nodes)
+runner.filter_nodes()
+
 if not args.no_util:
     import perf_metrics
     setup_with_metrics(perf_metrics, runner)
@@ -2120,10 +2173,6 @@ if args.frequency:
     args.metrics = True
     frequency.SetupCPU(runner, cpu)
     args.metrics = old_metrics
-
-if args.nodes:
-    runner.check_nodes(args.nodes)
-runner.filter_nodes()
 
 if args.per_socket and not smt_mode:
     rest = ["--per-socket"] + rest
@@ -2199,4 +2248,5 @@ if args.sample_repeat:
 else:
     ret = measure_and_sample(None)
 
+out.print_footer()
 sys.exit(ret)
