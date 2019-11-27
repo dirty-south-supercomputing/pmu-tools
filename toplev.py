@@ -462,7 +462,7 @@ if args.handle_errata:
     args.ignore_errata = False
 
 import_mode = args._import is not None
-event_nocheck = import_mode or args.no_check # XXX also for print
+event_nocheck = import_mode or args.no_check
 print_all = args.verbose # or args.csv
 dont_hide = args.verbose
 csv_mode = args.csv
@@ -487,6 +487,8 @@ def gen_cpu_name(cpu):
     for j in known_cpus:
         if cpu == j[0]:
             if isinstance(j[1][0], int):
+                if cpu == "skx":
+                    return "GenuineIntel-6-%02X-4" % j[1][0]
                 return "GenuineIntel-6-%02X" % j[1][0]
             return "GenuineIntel-6-%02X-%02X" % j[1][0]
     assert False
@@ -2031,7 +2033,12 @@ runner = Runner(args.level)
 
 pe = lambda x: None
 if args.debug:
-    pe = lambda x: sys.stdout.write(x + "\n")
+    printed_error = set()
+    def print_err(x):
+        if x not in printed_error:
+            print x
+            printed_error.add(x)
+    pe = lambda e: print_err(e)
 
 if args.single_thread:
     cpu.ht = False
