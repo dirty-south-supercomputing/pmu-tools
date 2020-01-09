@@ -28,7 +28,7 @@
  */
 
 /* Poor man's perf stat using jevents */
-/* jstat [-a] [-p pid] [-e events] program */
+/* jstat [-a] [-p pid] [-e events] [-A] [-C cpus] program */
 /* Supports named events if downloaded first (w/ event_download.py) */
 /* Run listevents to show the available events */
 
@@ -38,17 +38,21 @@
 #include <stdint.h>
 #include <string.h>
 #include <getopt.h>
+#include <errno.h>
 #include <signal.h>
 #include <locale.h>
 #include <sys/wait.h>
 #include <sys/fcntl.h>
+#include <sys/time.h>
 #include "jevents.h"
 #include "jsession.h"
 
 #define err(x) perror(x), exit(1)
 #define PAIR(x) x, sizeof(x) - 1
 
-void print_data(struct eventlist *el)
+FILE *outfh;
+
+void print_data_aggr(struct eventlist *el, double ts, bool print_ts)
 {
 	struct event *e;
 	int i;
@@ -57,26 +61,101 @@ void print_data(struct eventlist *el)
 		uint64_t v = 0;
 		for (i = 0; i < el->num_cpus; i++)
 			v += event_scaled_value(e, i);
-		printf("%-30s %'10lu\n", e->event, v);
+		if (print_ts)
+			fprintf(outfh, "%08.4f\t", ts);
+		fprintf(outfh, "%-30s %'15lu\n", e->extra.name ? e->extra.name : e->event, v);
 	}
 }
+
+void print_data_no_aggr(struct eventlist *el, double ts, bool print_ts)
+{
+	struct event *e;
+	int i;
+
+	for (e = el->eventlist; e; e = e->next) {
+		uint64_t v;
+		for (i = 0; i < el->num_cpus; i++) {
+			if (e->efd[i].fd < 0)
+				continue;
+			v = event_scaled_value(e, i);
+			if (print_ts)
+				fprintf(outfh, "%08.4f\t", ts);
+			fprintf(outfh, "%3d %-30s %'15lu\n", i,
+					e->extra.name ? e->extra.name : e->event, v);
+		}
+	}
+}
+
+void print_data(struct eventlist *el, double ts, bool print_ts, bool no_aggr)
+{
+	if (no_aggr)
+		print_data_no_aggr(el, ts, print_ts);
+	else
+		print_data_aggr(el, ts, print_ts);
+}
+
+enum { OPT_APPEND = 1000 };
 
 static struct option opts[] = {
 	{ "all-cpus", no_argument, 0, 'a' },
 	{ "events", required_argument, 0, 'e'},
+	{ "interval", required_argument, 0, 'I' },
+	{ "cpu", required_argument, 0, 'C' },
+	{ "no-aggr", no_argument, 0, 'A' },
+	{ "verbose", no_argument, 0, 'v' },
+	{ "append", no_argument, 0, OPT_APPEND },
+	{ "delay", required_argument, 0, 'D' },
 	{},
 };
 
 void usage(void)
 {
-	fprintf(stderr, "Usage: jstat [-a] [-e events] program\n"
-			"--all -a  Measure global system\n"
-			"-e --events list  Comma separate list of events to measure. Use {} for groups\n"
-			"Run event_download.py once first to use symbolic events\n");
+	fprintf(stderr, "Usage: jstat [-a] [-e events] [-I interval] [-C cpus] [-A] program\n"
+			"--all -a	     Measure global system\n"
+			"-e --events list    Comma separate list of events to measure. Use {} for groups\n"
+			"-I N --interval N   Print events every N ms\n"
+			"-C CPUS --cpu CPUS  Only measure on CPUs. List of numbers or ranges a-b\n"
+			"-A --no-aggr        Print values for individual CPUs\n"
+			"-v --verbose        Print perf_event_open arguments\n"
+			"-o file	     Output results to file\n"
+			"--append	     (with -o) Append results to file\n"
+			"-D N --delay N	     Wait N ms after starting program before measurement\n"
+			"Run event_download.py once first to use symbolic events\n"
+			"Run listevents to show available events\n");
+
 	exit(1);
 }
 
 void sigint(int sig) {}
+
+volatile bool gotalarm;
+
+double starttime;
+
+void sigalarm(int sig)
+{
+	gotalarm = true;
+}
+
+double gettime(void)
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (double)tv.tv_sec * 1e6 + tv.tv_usec;
+}
+
+bool cont_measure(int ret, struct eventlist *el, bool no_aggr)
+{
+	if (ret < 0 && gotalarm) {
+		gotalarm = false;
+		read_all_events(el);
+		if (!starttime)
+			starttime = gettime();
+		print_data(el, (gettime() - starttime) / 1e6, true, no_aggr);
+		return true;
+	}
+	return false;
+}
 
 int main(int ac, char **av)
 {
@@ -86,12 +165,21 @@ int main(int ac, char **av)
 	struct eventlist *el;
 	bool measure_all = false;
 	int measure_pid = -1;
+	int interval = 0;
 	int child_pid;
+	int ret;
+	char *cpumask = NULL;
+	bool no_aggr = false;
+	int verbose = 0;
+	char *openmode = "w";
+	char *outname = NULL;
+	int initial_delay = 0;
 
 	setlocale(LC_NUMERIC, "");
 	el = alloc_eventlist();
+	outfh = stderr;
 
-	while ((opt = getopt_long(ac, av, "ae:p:", opts, NULL)) != -1) {
+	while ((opt = getopt_long(ac, av, "ae:p:I:C:Avo:D:", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'e':
 			if (parse_events(el, optarg) < 0)
@@ -101,8 +189,37 @@ int main(int ac, char **av)
 		case 'a':
 			measure_all = true;
 			break;
+		case 'I':
+			interval = atoi(optarg);
+			break;
+		case 'C':
+			cpumask = optarg;
+			break;
+		case 'A':
+			no_aggr = true;
+			break;
+		case 'v':
+			verbose++;
+			break;
+		case OPT_APPEND:
+			openmode = "a";
+			break;
+		case 'o':
+			outname = optarg;
+			break;
+		case 'D':
+			initial_delay = atoi(optarg);
+			break;
 		default:
 			usage();
+		}
+	}
+	if (outname) {
+		outfh = fopen(outname, openmode);
+		if (!outfh) {
+			fprintf(stderr, "Cannot open %s: %s\n", optarg,
+					strerror(errno));
+			exit(1);
 		}
 	}
 	if (av[optind] == NULL && !measure_all) {
@@ -119,7 +236,8 @@ int main(int ac, char **av)
 	if (measure_pid == 0) {
 		char buf;
 		/* Wait for events to be set up */
-		read(child_pipe[0], &buf, 1);
+		if (!initial_delay)
+			read(child_pipe[0], &buf, 1);
 		if (av[optind] == NULL) {
 			pause();
 			_exit(0);
@@ -128,16 +246,45 @@ int main(int ac, char **av)
 		write(2, PAIR("Cannot execute program\n"));
 		_exit(1);
 	}
-	if (setup_events(el, measure_all, measure_pid) < 0)
+	if (initial_delay)
+		usleep(initial_delay * 1000);
+	if (setup_events_cpumask(el, measure_all, measure_pid, cpumask,
+				initial_delay == 0 && !measure_all) < 0)
 		exit(1);
+	if (verbose)
+		print_event_list_attr(el, stdout);
 	signal(SIGINT, sigint);
+	if (interval) {
+		struct itimerval itv = {
+			.it_value = {
+				.tv_sec = interval / 1000,
+				.tv_usec = (interval % 1000) * 1000
+			},
+		};
+		itv.it_interval = itv.it_value;
+
+		sigaction(SIGALRM, &(struct sigaction){
+				.sa_handler = sigalarm,
+			 }, NULL);
+		setitimer(ITIMER_REAL, &itv, NULL);
+	}
 	if (child_pid >= 0) {
 		write(child_pipe[1], "x", 1);
-		waitpid(measure_pid, NULL, 0);
+		for (;;) {
+			ret = waitpid(measure_pid, NULL, 0);
+			if (!cont_measure(ret, el, no_aggr))
+				break;
+		}
 	} else {
-		pause();
+		for (;;) {
+			ret = pause();
+			if (!cont_measure(ret, el, no_aggr))
+				break;
+		}
 	}
 	read_all_events(el);
-	print_data(el);
+	print_data(el, (gettime() - starttime)/1e6,
+			interval != 0 && starttime,
+			no_aggr);
 	return 0;
 }

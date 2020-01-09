@@ -116,6 +116,8 @@ int jevents_update_qual(const char *qual, struct perf_event_attr *attr,
 			else if (sscanf(qual, "config2=%llx%n", &c, &skip) == 1)
 				attr->config2 |= c;
 			qual += skip;
+			if (*qual == 0)
+				break;
 		}
 
 		switch (*qual) { 
@@ -153,7 +155,9 @@ int jevents_update_qual(const char *qual, struct perf_event_attr *attr,
 	return 0;
 }
 
-static bool special_attr(char *name, int val, struct perf_event_attr *attr)
+static bool special_attr(char *name, unsigned long long val,
+			 struct perf_event_attr *attr,
+			 struct jevent_extra *je, char *term)
 {
 	if (!strcmp(name, "period")) {
 		attr->sample_period = val;
@@ -169,7 +173,7 @@ static bool special_attr(char *name, int val, struct perf_event_attr *attr)
 		return true;
 	}
 	if (!strcmp(name, "config1")) {
-		attr->config2 |= val;
+		attr->config1 |= val;
 		return true;
 	}
 	if (!strcmp(name, "config2")) {
@@ -177,14 +181,18 @@ static bool special_attr(char *name, int val, struct perf_event_attr *attr)
 		return true;
 	}
 	if (!strcmp(name, "name")) {
-		// we accept the name attribute, but don't have anywhere to put it inside
-		// perf_event_attr, so we just drop it but at least avoid an unhandled attr error
+		char nname[500];
+		if (je && sscanf(term, "%*[^=]=%499s", nname) != 1)
+			return false;
+		je->name = strdup(nname + ((nname[0] == '"' || nname[0] == '\'') ? 1 : 0));
+		je->name[strcspn(je->name, "\"'")] = 0;
 		return true;
 	}
 	return false;
 }
 
-static int parse_terms(char *pmu, char *config, struct perf_event_attr *attr, int recur)
+static int parse_terms(char *pmu, char *config, struct perf_event_attr *attr, int recur,
+		       struct jevent_extra *extra)
 {
 	char *format = NULL;
 	char *term;
@@ -201,7 +209,7 @@ static int parse_terms(char *pmu, char *config, struct perf_event_attr *attr, in
 		n = sscanf(term, "%30[^=]=%lli", name, &val);
 		if (n < 1)
 			break;
-		if (special_attr(name, val, attr))
+		if (special_attr(name, val, attr, extra, term))
 			continue;
 		free(format);
 		if (read_file(&format, "/sys/devices/%s/format/%s", pmu, name) < 0) {
@@ -209,7 +217,7 @@ static int parse_terms(char *pmu, char *config, struct perf_event_attr *attr, in
 
 			if (recur == 0 &&
 			    read_file(&alias, "/sys/devices/%s/events/%s", pmu, name) == 0) {
-				if (parse_terms(pmu, alias, attr, 1) < 0) {
+				if (parse_terms(pmu, alias, attr, 1, NULL) < 0) {
 					free(alias);
 					fprintf(stderr, "Cannot parse kernel event alias %s for %s\n", name,
 							term);
@@ -269,10 +277,154 @@ bool jevent_pmu_uncore(const char *str)
 		return false;
 	int ret = read_file(&cpumask, "/sys/devices/%s/cpumask", pmu);
 	if (ret < 0)
+		ret = read_file(&cpumask, "/sys/devices/uncore_%s/cpumask", pmu);
+	if (ret < 0)
+		ret = read_file(&cpumask, "/sys/devices/uncore_%s_0/cpumask", pmu);
+	if (ret < 0)
+		ret = read_file(&cpumask, "/sys/devices/uncore_%s_1/cpumask", pmu);
+	if (ret < 0)
 		return false;
 	bool isuncore = sscanf(cpumask, "%d", &cpus) == 1 && cpus == 0;
 	free(cpumask);
 	return isuncore;
+}
+
+/**
+ * jevent_free_extra - Free data in jevent_extra
+ * @extra: extra structure to free.
+ *
+ * Note the extra structure itself is not freed, but supplied
+ * by the caller.
+ */
+void jevent_free_extra(struct jevent_extra *extra)
+{
+	free(extra->name);
+	free(extra->decoded);
+	if (extra->multi_pmu)
+		globfree(&extra->pmus);
+}
+
+/**
+ * jevent_copy_extra - Copy extra structure.
+ * @dst: Destination
+ * @src: Source
+ *
+ * Does not copy the pmu list, but everything else.
+ * Result needs to be freed with jevent_free_extra().
+ */
+
+void jevent_copy_extra(struct jevent_extra *dst, struct jevent_extra *src)
+{
+	memset(dst, 0, sizeof(struct jevent_extra));
+	if (src->name)
+		dst->name = strdup(src->name);
+	if (src->decoded)
+		dst->decoded = strdup(src->decoded);
+}
+
+/**
+ * jevent_next_pmu - update multi_pmu attr to next pmu
+ *
+ * For extra->multi_pmu update the attr to the next pmu in the list.
+ * Returns 1 when there was another pmu, 0 when the end of PMUs is
+ * reached, or -1 for errors.
+ */
+int jevent_next_pmu(struct jevent_extra *extra,
+		    struct perf_event_attr *attr)
+{
+	if (!extra->multi_pmu || !extra->pmus.gl_pathv)
+		return 0;
+	if (extra->next_pmu < extra->pmus.gl_pathc) {
+		int n = extra->next_pmu++;
+		char pmu[30];
+		char *type = NULL;
+		if (try_pmu_type(&type,
+				 strrchr(extra->pmus.gl_pathv[n], '/'),
+				 pmu) < 0)
+			return -1;
+		attr->type = atoi(type);
+		free(type);
+		return 1;
+	}
+	return 0;
+}
+
+/**
+ * jevent_name_to_attr_extra - Resolve perf style event to perf_attr
+ * @str: perf style event (e.g. cpu/event=1/)
+ * @attr: perf_attr to fill in.
+ * @extra:  jevent_extra to output extra information, or NULL.
+ *
+ * Resolve perf new style event descriptor to perf ATTR. User must initialize
+ * attr->sample_type and attr->read_format as needed after this call,
+ * and possibly other fields. Returns 0 when succeeded.
+ *
+ * extra is filled in with extra information on the event. It contains
+ * allocated data and needs to be freed with jevent_free_extra() later
+ * unless an error was returned.
+ *
+ * Some events may need multiple PMUs. In this case extra->multi_pmu
+ * is set, and jevent_next_pmu() must be used to iterate the attr
+ * through the extra PMUs.
+ */
+int jevent_name_to_attr_extra(const char *str, struct perf_event_attr *attr,
+			      struct jevent_extra *extra)
+{
+	char pmu[30], config[200];
+	int qual_off = -1;
+	struct jevent_extra dummy;
+
+	memset(attr, 0, sizeof(struct perf_event_attr));
+	attr->size = PERF_ATTR_SIZE_VER0;
+	attr->type = PERF_TYPE_RAW;
+
+	if (!extra)
+		extra = &dummy;
+	memset(extra, 0, sizeof(struct jevent_extra));
+
+	if (!strcmp(str, "cycles"))
+		str = "cpu/cpu-cycles/";
+	if (!strcmp(str, "branches"))
+		str = "cpu/branch-instructions/";
+
+	if (sscanf(str, "r%llx%n", &attr->config, &qual_off) == 1) {
+		assert(qual_off != -1);
+		if (str[qual_off] == 0)
+			return 0;
+		if (str[qual_off] == ':' && jevents_update_qual(str + qual_off + 1, attr, str) == 0)
+			return 0;
+		return -1;
+	}
+	if (sscanf(str, "%30[^/]/%200[^/]/%n", pmu, config, &qual_off) < 2)
+		return -1;
+	char *type = NULL;
+	if (try_pmu_type(&type, "%s", pmu) < 0) {
+		if (try_pmu_type(&type, "uncore_%s", pmu) < 0) {
+			char *gs;
+			int ret;
+
+			asprintf(&gs, "/sys/devices/uncore_%s_*", pmu);
+			ret = glob(gs, 0, NULL, &extra->pmus);
+			free(gs);
+			if (ret)
+				return -1;
+			if (try_pmu_type(&type, strrchr(extra->pmus.gl_pathv[0], '/'), pmu) < 0)
+				goto err_free;
+			extra->next_pmu = 1;
+			extra->multi_pmu = true;
+		}
+	}
+	attr->type = atoi(type);
+	free(type);
+	if (parse_terms(pmu, config, attr, 0, extra) < 0)
+		goto err_free;
+	if (qual_off != -1 && jevents_update_qual(str + qual_off, attr, str) < 0)
+		goto err_free;
+	return 0;
+
+err_free:
+	jevent_free_extra(extra);
+	return -1;
 }
 
 /**
@@ -283,40 +435,12 @@ bool jevent_pmu_uncore(const char *str)
  * Resolve perf new style event descriptor to perf ATTR. User must initialize
  * attr->sample_type and attr->read_format as needed after this call,
  * and possibly other fields. Returns 0 when succeeded.
+ *
+ * Deprecated. Should migrate to jevent_name_to_attr_extra.
  */
 int jevent_name_to_attr(const char *str, struct perf_event_attr *attr)
 {
-	char pmu[30], config[200];
-	int qual_off = -1;
-
-	memset(attr, 0, sizeof(struct perf_event_attr));
-	attr->size = PERF_ATTR_SIZE_VER0;
-	attr->type = PERF_TYPE_RAW;
-
-	if (sscanf(str, "r%llx%n", &attr->config, &qual_off) == 1) {
-		assert(qual_off != -1);
-		if (str[qual_off] == 0)
-			return 0;
-		if (str[qual_off] == ':' && jevents_update_qual(str + qual_off, attr, str) == 0)
-			return 0;
-		return -1;
-	}
-	if (sscanf(str, "%30[^/]/%200[^/]/%n", pmu, config, &qual_off) < 2)
-		return -1;
-	char *type = NULL;
-	/* FIXME need interface for multiple outputs and try more instances */
-	if (try_pmu_type(&type, "%s", pmu) < 0 &&
-	    try_pmu_type(&type, "uncore_%s", pmu) < 0 &&
-	    try_pmu_type(&type, "uncore_%s_0", pmu) < 0 &&
-	    try_pmu_type(&type, "uncore_%s_1", pmu) < 0)
-		return -1;
-	attr->type = atoi(type);
-	free(type);
-	if (parse_terms(pmu, config, attr, 0) < 0)
-		return -1;
-	if (qual_off != -1 && jevents_update_qual(str + qual_off, attr, str) < 0)
-		return -1;
-	return 0;
+	return jevent_name_to_attr_extra(str, attr, NULL);
 }
 
 /**
@@ -394,6 +518,76 @@ char *resolve_pmu(int type)
 	}
 	globfree(&g);
 	return pmun;
+}
+
+int jevents_socket_cpus(int *len, int **cpup)
+{
+	unsigned char seen[1024];
+	glob_t g;
+	if (glob("/sys/devices/system/cpu/cpu*/topology/physical_package_id", 0, NULL, &g))
+		return -1;
+	memset(seen, 0, sizeof seen);
+	*cpup = calloc(g.gl_pathc, sizeof(int));
+	int i;
+	*len = 0;
+	for (i = 0; i < g.gl_pathc; i++) {
+		int cpu;
+		char *id;
+		int pid;
+		sscanf(g.gl_pathv[i], "/sys/devices/system/cpu/cpu%d", &cpu);
+		if (read_file(&id, g.gl_pathv[i]) < 0) {
+			free(*cpup);
+			*len = 0;
+			return -1;
+		}
+		sscanf(id, "%d", &pid);
+		free(id);
+		if (pid >= sizeof(seen)*8)
+			continue;
+		if (!(seen[pid / 8] & (1 << (pid % 8)))) {
+			seen[pid / 8] |= (1 << (pid % 8));
+			(*cpup)[(*len)++] = cpu;
+		}
+	}
+	globfree(&g);
+	return 0;
+}
+
+void jevent_print_attr(FILE *f, struct perf_event_attr *attr)
+{
+	fprintf(f, "type: %d\n", attr->type);
+	fprintf(f, "config: %llx\n", attr->config);
+	fprintf(f, "read_format: %llx\n", attr->read_format);
+	if (attr->sample_type)
+		fprintf(f, "sample_type: %llx\n", attr->sample_type);
+	fprintf(f, "sample_period/freq: %lld\n", attr->sample_period);
+	if (attr->config1)
+		fprintf(f, "config1: %llx\n", attr->config1);
+	if (attr->config2)
+		fprintf(f, "config1: %llx\n", attr->config1);
+	fprintf(f, "flags: ");
+#define FLAG(fl) if (attr->fl) fprintf(f, "%s ", #fl);
+#define FIELD(fl) if (attr->fl) fprintf(f, #fl ": %d ", attr->fl)
+	FLAG(disabled);
+	FLAG(inherit);
+	FLAG(pinned);
+	FLAG(exclusive);
+	FLAG(exclude_user);
+	FLAG(exclude_kernel);
+	FLAG(exclude_hv);
+	FLAG(exclude_idle);
+	FLAG(mmap);
+	FLAG(comm);
+	FLAG(freq);
+	FLAG(inherit_stat);
+	FLAG(enable_on_exec);
+	FLAG(task);
+	FLAG(watermark);
+	FLAG(exclude_host);
+	FLAG(exclude_guest);
+#undef FLAG
+	fprintf(f, "\n");
+	/* Some stuff missing */
 }
 
 #ifdef TEST

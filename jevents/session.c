@@ -50,6 +50,7 @@ struct eventlist *alloc_eventlist(void)
 	if (!el)
 		return NULL;
 	el->num_cpus = sysconf(_SC_NPROCESSORS_CONF);
+	jevents_socket_cpus(&el->num_sockets, &el->socket_cpus);
 	return el;
 }
 
@@ -57,6 +58,8 @@ static struct event *new_event(struct eventlist *el, char *s)
 {
 	struct event *e = calloc(sizeof(struct event) +
 				 sizeof(struct efd) * el->num_cpus, 1);
+	int i;
+
 	e->next = NULL;
 	if (!el->eventlist)
 		el->eventlist = e;
@@ -64,7 +67,31 @@ static struct event *new_event(struct eventlist *el, char *s)
 		el->eventlist_last->next = e;
 	el->eventlist_last = e;
 	e->event = strdup(s);
+	for (i = 0; i < el->num_cpus; i++)
+		e->efd[i].fd = -1;
 	return e;
+}
+
+static char *grab_event(char *s, char **next)
+{
+	char *p = s;
+	if (s == NULL || *s == 0)
+		return NULL;
+	*next = NULL;
+	while (*s) {
+		if (*s == '/') {
+			s++;
+			while (*s && *s != '/')
+				s++;
+		}
+		if (*s == ',') {
+			*s = 0;
+			*next = s + 1;
+			break;
+		}
+		s++;
+	}
+	return p;
 }
 
 /**
@@ -76,36 +103,67 @@ static struct event *new_event(struct eventlist *el, char *s)
  */
 int parse_events(struct eventlist *el, char *events)
 {
-	char *s, *tmp;
+	char *s, *next;
+	bool ingroup = false;
 
 	events = strdup(events);
 	if (!events)
 		return -1;
-	for (s = strtok_r(events, ",", &tmp);
-	     s;
-	     s = strtok_r(NULL, ",", &tmp)) {
+	next = events;
+	while ((s = grab_event(next, &next)) != NULL) {
 		bool group_leader = false, end_group = false;
 		int len;
 
 		if (s[0] == '{') {
 			s++;
 			group_leader = true;
+			ingroup = true;
 		} else if (len = strlen(s), len > 0 && s[len - 1] == '}') {
 			s[len - 1] = 0;
 			end_group = true;
 		}
 
 		struct event *e = new_event(el, s);
-		e->uncore = jevent_pmu_uncore(s);
 		e->group_leader = group_leader;
 		e->end_group = end_group;
-		if (resolve_event(s, &e->attr) < 0) {
+		e->ingroup = ingroup;
+		if (resolve_event_extra(s, &e->attr, &e->extra) < 0) {
 			fprintf(stderr, "Cannot resolve %s\n", e->event);
-			return -1;
+			goto err;
 		}
+		e->uncore = jevent_pmu_uncore(e->extra.decoded);
+		if (e->extra.multi_pmu) {
+			int err;
+			struct event *ne;
+			struct perf_event_attr attr = e->attr;
+
+			while ((err = jevent_next_pmu(&e->extra, &attr)) == 1) {
+				if (ingroup) {
+					// XXX should fix by duplicating the group
+					fprintf(stderr, "Cannot handle multi pmu event %s in group\n", s);
+					goto err;
+				}
+				ne = new_event(el, s);
+				ne->attr = attr;
+				ne->orig = e;
+				ne->uncore = e->uncore;
+				jevent_copy_extra(&ne->extra, &e->extra);
+			}
+			if (err < 0) {
+				fprintf(stderr, "Cannot find PMU for event %s\n", e->event);
+				goto err;
+			}
+		}
+		if (end_group)
+			ingroup = false;
 	}
 	free(events);
 	return 0;
+
+err:
+	free_eventlist(el);
+	free(events);
+	return -1;
 }
 
 static bool cpu_online(int i)
@@ -124,6 +182,32 @@ static bool cpu_online(int i)
 	return ret;
 }
 
+static bool cpumask_match(char *mask, int ocpu)
+{
+	if (!mask)
+		return true;
+	while (*mask) {
+		char *endp;
+		int cpu = strtoul(mask, &endp, 0);
+		if (mask == endp)
+			return false;
+		if (cpu == ocpu)
+			return true;
+		if (*endp == '-') {
+			mask = endp + 1;
+			int cpu2 = strtoul(mask, &endp, 0);
+			if (mask == endp)
+				return ocpu > cpu;
+			if (ocpu > cpu && ocpu <= cpu2)
+				return true;
+		}
+		mask = endp;
+		if (*mask == ',')
+			mask++;
+	}
+	return false;
+}
+
 /**
  * setup_event - Create perf descriptor for a single event.
  * @e: Event to measure.
@@ -131,16 +215,17 @@ static bool cpu_online(int i)
  * @leader: Leader event to define a group.
  * @measure_all: If true measure all processes (may need root)
  * @measure_pid: If not -1 measure specific process.
+ * @enable_on_exec: If true only enable on exec
  *
  * This is a low level function. Normally setup_events() should be used.
  * Return -1 on failure.
  */
 
 int setup_event(struct event *e, int cpu, struct event *leader,
-		bool measure_all, int measure_pid)
+		bool measure_all, int measure_pid, bool enable_on_exec)
 {
 	e->attr.inherit = 1;
-	if (!measure_all) {
+	if (enable_on_exec) {
 		e->attr.disabled = 1;
 		e->attr.enable_on_exec = 1;
 	}
@@ -170,35 +255,50 @@ int setup_event(struct event *e, int cpu, struct event *leader,
  * @el: List of events, allocated and parsed earlier.
  * @measure_all: If true measure all of system (may need root)
  * @measure_pid: If not -1 measure pid.
+ * @cpumask: string of cpus to measure on, or NULL for all
+ * @enable_on_exec: If true only enable on exec
  *
  * Return -1 on failure, otherwise 0.
  */
 
-int setup_events(struct eventlist *el, bool measure_all, int measure_pid)
+int setup_events_cpumask(struct eventlist *el, bool measure_all, int measure_pid,
+			 char *cpumask, bool enable_on_exec)
 {
 	struct event *e, *leader = NULL;
 	int i;
 	int err = 0;
 	int ret;
+	int success = 0;
 
 	for (e = el->eventlist; e; e = e->next) {
 		if (e->uncore) {
-			/* XXX for every socket. for now just 0. */
-			ret = setup_event(e, 0, leader, measure_all, measure_pid);
-			if (ret < 0) {
-				err = ret;
-				continue;
-			}
-			for (i = 1; i < el->num_cpus; i++)
+			for (i = 0; i < el->num_cpus; i++)
 				e->efd[i].fd = -1;
-		} else {
-			for (i = 0; i < el->num_cpus; i++) {
-				ret = setup_event(e, i, leader,
-						measure_all,
-						measure_pid);
+			for (i = 0; i < el->num_sockets; i++) {
+				if (!cpumask_match(cpumask, el->socket_cpus[i]))
+					continue;
+				ret = setup_event(e, el->socket_cpus[i], leader, measure_all,
+						  measure_pid, enable_on_exec);
 				if (ret < 0) {
 					err = ret;
 					continue;
+				} else {
+					success++;
+				}
+			}
+		} else {
+			for (i = 0; i < el->num_cpus; i++) {
+				if (!cpumask_match(cpumask, i))
+					continue;
+				ret = setup_event(e, i, leader,
+						measure_all,
+						measure_pid,
+						enable_on_exec);
+				if (ret < 0) {
+					err = ret;
+					continue;
+				} else {
+					success++;
 				}
 			}
 		}
@@ -207,7 +307,24 @@ int setup_events(struct eventlist *el, bool measure_all, int measure_pid)
 		if (e->end_group)
 			leader = NULL;
 	}
+	if (success > 0)
+		return 0;
 	return err;
+}
+
+/**
+ * setup_events - Set up perf events for a event list.
+ * @el: List of events, allocated and parsed earlier.
+ * @measure_all: If true measure all of system (may need root)
+ * @measure_pid: If not -1 measure pid.
+ *
+ * Return -1 on failure, otherwise 0.
+ */
+
+int setup_events(struct eventlist *el, bool measure_all, int measure_pid)
+{
+	return setup_events_cpumask(el, measure_all, measure_pid, NULL,
+			measure_all == 0);
 }
 
 /**
@@ -241,13 +358,6 @@ int read_all_events(struct eventlist *el)
 	int i;
 
 	for (e = el->eventlist; e; e = e->next) {
-		if (e->uncore) {
-			/* XXX all sockets */
-			if (e->efd[0].fd < 0)
-				continue;
-			if (read_event(e, 0) < 0)
-				return -1;
-		}
 		for (i = 0; i < el->num_cpus; i++) {
 			if (e->efd[i].fd < 0)
 				continue;
@@ -270,4 +380,55 @@ uint64_t event_scaled_value(struct event *e, int cpu)
 	if (val[1] != val[2] && val[2])
 		return val[0] * (double)val[1] / (double)val[2];
 	return val[0];
+}
+
+/**
+ * close_event - Close (but not free) an event.
+ * @el: Event list
+ * @e: Event to close
+ * After this setup_event can be called again.
+ */
+void close_event(struct eventlist *el, struct event *e)
+{
+	int i;
+	for (i = 0; i < el->num_cpus; i++) {
+		if (e->efd[i].fd >= 0) {
+			close(e->efd[i].fd);
+			e->efd[i].fd = -1;
+		}
+	}
+}
+
+/**
+ * free_eventlist - Free and close a event list and its events.
+ * @el: Event list to free.
+ */
+void free_eventlist(struct eventlist *el)
+{
+	struct event *e, *next;
+
+	for (e = el->eventlist; e; e = next) {
+		next = e->next;
+		close_event(el, e);
+		jevent_free_extra(&e->extra);
+		free(e->event);
+		free(e);
+	}
+	free(el->socket_cpus);
+	free(el);
+}
+
+void print_event_list_attr(struct eventlist *el, FILE *f)
+{
+	struct event *e;
+
+	for (e = el->eventlist; e; e = e->next) {
+		fprintf(f, "%s:\n", e->event);
+		if (e->extra.name)
+			fprintf(f, "name: %s\n", e->extra.name);
+		if (e->extra.decoded)
+			fprintf(f, "perf: %s\n", e->extra.decoded);
+		jevent_print_attr(f, &e->attr);
+		fprintf(f, "\n");
+	}
 }
