@@ -51,6 +51,14 @@
 #define PAIR(x) x, sizeof(x) - 1
 
 FILE *outfh;
+uint64_t (*scaled_value)(struct event *e, int cpu) = event_scaled_value;
+bool merge;
+
+void print_runtime(uint64_t *val)
+{
+	if (val[1] != val[2])
+		fprintf(outfh, " [%2.2f%%]", ((double)val[2] / val[1]) * 100.);
+}
 
 void print_data_aggr(struct eventlist *el, double ts, bool print_ts)
 {
@@ -58,12 +66,22 @@ void print_data_aggr(struct eventlist *el, double ts, bool print_ts)
 	int i;
 
 	for (e = el->eventlist; e; e = e->next) {
-		uint64_t v = 0;
-		for (i = 0; i < el->num_cpus; i++)
-			v += event_scaled_value(e, i);
+		if (merge && e->orig)
+			continue;
+
+		uint64_t v = 0,val[3] = {0,0,0};
+		for (i = 0; i < el->num_cpus; i++) {
+			v += scaled_value(e, i);
+			// assumes all are scaled the same way
+			val[1] += e->efd[i].val[1];
+			val[2] += e->efd[i].val[2];
+		}
+
 		if (print_ts)
 			fprintf(outfh, "%08.4f\t", ts);
-		fprintf(outfh, "%-30s %'15lu\n", e->extra.name ? e->extra.name : e->event, v);
+		fprintf(outfh, "%-30s %'15lu", e->extra.name ? e->extra.name : e->event, v);
+		print_runtime(val);
+		putc('\n', outfh);
 	}
 }
 
@@ -77,24 +95,22 @@ void print_data_no_aggr(struct eventlist *el, double ts, bool print_ts)
 		for (i = 0; i < el->num_cpus; i++) {
 			if (e->efd[i].fd < 0)
 				continue;
-			v = event_scaled_value(e, i);
+			if (merge && e->orig)
+				continue;
+			v = scaled_value(e, i);
 			if (print_ts)
 				fprintf(outfh, "%08.4f\t", ts);
-			fprintf(outfh, "%3d %-30s %'15lu\n", i,
+			fprintf(outfh, "%3d %-30s %'15lu", i,
 					e->extra.name ? e->extra.name : e->event, v);
+			print_runtime(e->efd[i].val);
+			putc('\n', outfh);
 		}
 	}
 }
 
-void print_data(struct eventlist *el, double ts, bool print_ts, bool no_aggr)
-{
-	if (no_aggr)
-		print_data_no_aggr(el, ts, print_ts);
-	else
-		print_data_aggr(el, ts, print_ts);
-}
+void (*print_data)(struct eventlist *el, double ts, bool print_ts) = print_data_aggr;
 
-enum { OPT_APPEND = 1000 };
+enum { OPT_APPEND = 1000, OPT_MERGE };
 
 static struct option opts[] = {
 	{ "all-cpus", no_argument, 0, 'a' },
@@ -105,6 +121,7 @@ static struct option opts[] = {
 	{ "verbose", no_argument, 0, 'v' },
 	{ "append", no_argument, 0, OPT_APPEND },
 	{ "delay", required_argument, 0, 'D' },
+	{ "merge", no_argument, 0, OPT_MERGE },
 	{},
 };
 
@@ -120,6 +137,7 @@ void usage(void)
 			"-o file	     Output results to file\n"
 			"--append	     (with -o) Append results to file\n"
 			"-D N --delay N	     Wait N ms after starting program before measurement\n"
+			"--merge	     Sum multiple instances of uncore events\n"
 			"Run event_download.py once first to use symbolic events\n"
 			"Run listevents to show available events\n");
 
@@ -144,14 +162,12 @@ double gettime(void)
 	return (double)tv.tv_sec * 1e6 + tv.tv_usec;
 }
 
-bool cont_measure(int ret, struct eventlist *el, bool no_aggr)
+bool cont_measure(int ret, struct eventlist *el)
 {
 	if (ret < 0 && gotalarm) {
 		gotalarm = false;
 		read_all_events(el);
-		if (!starttime)
-			starttime = gettime();
-		print_data(el, (gettime() - starttime) / 1e6, true, no_aggr);
+		print_data(el, (gettime() - starttime) / 1e6, true);
 		return true;
 	}
 	return false;
@@ -169,11 +185,11 @@ int main(int ac, char **av)
 	int child_pid;
 	int ret;
 	char *cpumask = NULL;
-	bool no_aggr = false;
 	int verbose = 0;
 	char *openmode = "w";
 	char *outname = NULL;
 	int initial_delay = 0;
+	int flags = 0;
 
 	setlocale(LC_NUMERIC, "");
 	el = alloc_eventlist();
@@ -188,6 +204,7 @@ int main(int ac, char **av)
 			break;
 		case 'a':
 			measure_all = true;
+			flags |= SE_MEASURE_ALL;
 			break;
 		case 'I':
 			interval = atoi(optarg);
@@ -196,13 +213,17 @@ int main(int ac, char **av)
 			cpumask = optarg;
 			break;
 		case 'A':
-			no_aggr = true;
+			print_data = print_data_no_aggr;
 			break;
 		case 'v':
 			verbose++;
 			break;
 		case OPT_APPEND:
 			openmode = "a";
+			break;
+		case OPT_MERGE:
+			merge = true;
+			scaled_value = event_scaled_value_sum;
 			break;
 		case 'o':
 			outname = optarg;
@@ -248,8 +269,10 @@ int main(int ac, char **av)
 	}
 	if (initial_delay)
 		usleep(initial_delay * 1000);
-	if (setup_events_cpumask(el, measure_all, measure_pid, cpumask,
-				initial_delay == 0 && !measure_all) < 0)
+	if (initial_delay == 0 && !measure_all)
+		flags |= SE_ENABLE_ON_EXEC;
+
+	if (setup_events_cpumask(el, measure_pid, cpumask, flags) < 0)
 		exit(1);
 	if (verbose)
 		print_event_list_attr(el, stdout);
@@ -258,7 +281,7 @@ int main(int ac, char **av)
 		struct itimerval itv = {
 			.it_value = {
 				.tv_sec = interval / 1000,
-				.tv_usec = (interval % 1000) * 1000
+				.tv_usec = (interval % 1000) * 1000,
 			},
 		};
 		itv.it_interval = itv.it_value;
@@ -266,25 +289,21 @@ int main(int ac, char **av)
 		sigaction(SIGALRM, &(struct sigaction){
 				.sa_handler = sigalarm,
 			 }, NULL);
+		starttime = gettime();
 		setitimer(ITIMER_REAL, &itv, NULL);
 	}
 	if (child_pid >= 0) {
 		write(child_pipe[1], "x", 1);
-		for (;;) {
+		do
 			ret = waitpid(measure_pid, NULL, 0);
-			if (!cont_measure(ret, el, no_aggr))
-				break;
-		}
+		while (cont_measure(ret, el));
 	} else {
-		for (;;) {
+		do
 			ret = pause();
-			if (!cont_measure(ret, el, no_aggr))
-				break;
-		}
+		while (cont_measure(ret, el));
 	}
 	read_all_events(el);
 	print_data(el, (gettime() - starttime)/1e6,
-			interval != 0 && starttime,
-			no_aggr);
+			interval != 0 && starttime);
 	return 0;
 }

@@ -100,6 +100,8 @@ static char *grab_event(char *s, char **next)
  * @events: Comma separated lists of events. {} style groups are legal.
  *
  * JSON events are supported, if the event lists are downloaded first.
+ * In case of an error the caller needs to call free_eventlist, unless
+ * they want to reuse the already existing events.
  */
 int parse_events(struct eventlist *el, char *events)
 {
@@ -147,6 +149,7 @@ int parse_events(struct eventlist *el, char *events)
 				ne->attr = attr;
 				ne->orig = e;
 				ne->uncore = e->uncore;
+				e->num_clones++;
 				jevent_copy_extra(&ne->extra, &e->extra);
 			}
 			if (err < 0) {
@@ -161,7 +164,6 @@ int parse_events(struct eventlist *el, char *events)
 	return 0;
 
 err:
-	free_eventlist(el);
 	free(events);
 	return -1;
 }
@@ -213,19 +215,18 @@ static bool cpumask_match(char *mask, int ocpu)
  * @e: Event to measure.
  * @cpu: CPU to measure.
  * @leader: Leader event to define a group.
- * @measure_all: If true measure all processes (may need root)
  * @measure_pid: If not -1 measure specific process.
- * @enable_on_exec: If true only enable on exec
+ * @flags:  Measurement flags: %SE_ENABLE_ON_EXEC, %SE_MEASURE_ALL
  *
  * This is a low level function. Normally setup_events() should be used.
  * Return -1 on failure.
  */
 
-int setup_event(struct event *e, int cpu, struct event *leader,
-		bool measure_all, int measure_pid, bool enable_on_exec)
+int setup_event_flags(struct event *e, int cpu, struct event *leader,
+		      int measure_pid, int flags)
 {
 	e->attr.inherit = 1;
-	if (enable_on_exec) {
+	if (flags & SE_ENABLE_ON_EXEC) {
 		e->attr.disabled = 1;
 		e->attr.enable_on_exec = 1;
 	}
@@ -233,7 +234,7 @@ int setup_event(struct event *e, int cpu, struct event *leader,
 				PERF_FORMAT_TOTAL_TIME_RUNNING;
 
 	e->efd[cpu].fd = perf_event_open(&e->attr,
-			measure_all ? -1 : measure_pid,
+			(flags & SE_MEASURE_ALL) ? -1 : measure_pid,
 			cpu,
 			leader ? leader->efd[cpu].fd : -1,
 			0);
@@ -251,18 +252,37 @@ int setup_event(struct event *e, int cpu, struct event *leader,
 }
 
 /**
+ * setup_event - Create perf descriptor for a single event.
+ * @e: Event to measure.
+ * @cpu: CPU to measure.
+ * @leader: Leader event to define a group.
+ * @measure_all: If true measure all processes (may need root)
+ * @measure_pid: If not -1 measure specific process.
+ *
+ * This is a low level function. Normally setup_events() should be used.
+ * Return -1 on failure.
+ */
+
+int setup_event(struct event *e, int cpu, struct event *leader,
+		bool measure_all, int measure_pid)
+{
+	return setup_event_flags(e, cpu, leader,
+			measure_pid,
+			!measure_all ? SE_ENABLE_ON_EXEC : 0);
+}
+
+/**
  * setup_events - Set up perf events for a event list.
  * @el: List of events, allocated and parsed earlier.
- * @measure_all: If true measure all of system (may need root)
  * @measure_pid: If not -1 measure pid.
  * @cpumask: string of cpus to measure on, or NULL for all
- * @enable_on_exec: If true only enable on exec
+ * @flags: %SE_MEASURE_ALL or %SE_ENABLE_ON_EXEC
  *
  * Return -1 on failure, otherwise 0.
  */
 
-int setup_events_cpumask(struct eventlist *el, bool measure_all, int measure_pid,
-			 char *cpumask, bool enable_on_exec)
+int setup_events_cpumask(struct eventlist *el, int measure_pid,
+			 char *cpumask, int flags)
 {
 	struct event *e, *leader = NULL;
 	int i;
@@ -277,8 +297,8 @@ int setup_events_cpumask(struct eventlist *el, bool measure_all, int measure_pid
 			for (i = 0; i < el->num_sockets; i++) {
 				if (!cpumask_match(cpumask, el->socket_cpus[i]))
 					continue;
-				ret = setup_event(e, el->socket_cpus[i], leader, measure_all,
-						  measure_pid, enable_on_exec);
+				ret = setup_event_flags(e, el->socket_cpus[i], leader,
+						  measure_pid, flags);
 				if (ret < 0) {
 					err = ret;
 					continue;
@@ -290,10 +310,9 @@ int setup_events_cpumask(struct eventlist *el, bool measure_all, int measure_pid
 			for (i = 0; i < el->num_cpus; i++) {
 				if (!cpumask_match(cpumask, i))
 					continue;
-				ret = setup_event(e, i, leader,
-						measure_all,
+				ret = setup_event_flags(e, i, leader,
 						measure_pid,
-						enable_on_exec);
+						flags);
 				if (ret < 0) {
 					err = ret;
 					continue;
@@ -323,8 +342,8 @@ int setup_events_cpumask(struct eventlist *el, bool measure_all, int measure_pid
 
 int setup_events(struct eventlist *el, bool measure_all, int measure_pid)
 {
-	return setup_events_cpumask(el, measure_all, measure_pid, NULL,
-			measure_all == 0);
+	return setup_events_cpumask(el, measure_pid, NULL,
+			measure_all ? SE_MEASURE_ALL : SE_ENABLE_ON_EXEC);
 }
 
 /**
@@ -380,6 +399,27 @@ uint64_t event_scaled_value(struct event *e, int cpu)
 	if (val[1] != val[2] && val[2])
 		return val[0] * (double)val[1] / (double)val[2];
 	return val[0];
+}
+
+/**
+ * event_scaled_value_sum - Retrieve a summed up read value for a cpu
+ * @e: Event
+ * @cpu: CPU number
+ * Return scaled value read earlier. When the event was cloned
+ * (e.g. uncore event with multiple instances) it returns
+ * the sum of clones. @e must be the first event, and later
+ * clones (e->orig != NULL) should be skipped by caller.
+ */
+uint64_t event_scaled_value_sum(struct event *e, int cpu)
+{
+	uint64_t sum = event_scaled_value(e, cpu);
+	int num_clones = e->num_clones;
+	struct event *ce;
+	for (ce = e->next; ce && num_clones > 0; ce = ce->next) {
+		if (ce->orig == e)
+			sum += event_scaled_value(ce, cpu);
+	}
+	return sum;
 }
 
 /**

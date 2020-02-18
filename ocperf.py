@@ -180,7 +180,7 @@ uncore_map = (
     (r"state=?(0x[0-9a-fA-F]+)", "filter_state="))
 
 uncore_map_thresh = (
-    (r"c(?:mask=)?(0x[0-9a-fA-F]+|[0-9]+)", "thresh="),)
+    (r"c(?:mask=)?([0-9a-fA-Fx]+)", "thresh="),)
 
 uncore_map_cmask = (
     (r"c(?:mask=)?(0x[0-9a-fA-F]+|[0-9]+)", "cmask="),)
@@ -279,7 +279,16 @@ class Event:
         return ename
 
     def filter_qual(self):
-        pass
+        def check_qual(q):
+            if q == "":
+                return True
+            if "=" in q:
+                q, _ = q.split("=")
+            if has_format_any(q, "cpu"):
+                return True
+            warn_once("cpu: format %s not supported. Filtering out" % q)
+            return False
+        self.newextra = ",".join(filter(check_qual, self.newextra.split(",")))
 
 box_to_perf = {
     "cbo": "cbox",
@@ -816,7 +825,7 @@ def add_extra_env(emap, el):
         uc = os.getenv("UNCORE")
         if uc:
             uc = canon_emapvar(uc, "uncore")
-            uc = event_download.eventlist_name(el, "uncore")
+            uc = event_download.eventlist_name(uc, "uncore")
             emap.add_uncore(uc)
         else:
             uc = event_download.eventlist_name(el, "uncore")
@@ -840,7 +849,6 @@ def add_extra_env(emap, el):
     read_map("EVENTMAP2", "core", lambda r: emap.read_events(r))
     read_map("EVENTMAP3", "core", lambda r: emap.read_events(r))
     read_map("UNCORE2", "uncore", lambda r: emap.add_uncore(r))
-    return emap
 
 def canon_emapvar(el, typ):
     if ("*" in el or "." in el or "_" in el) and not "/" in el and not file_exists(el):

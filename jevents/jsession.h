@@ -16,6 +16,7 @@ struct event {
 	bool end_group, group_leader, ingroup;
 	bool uncore;
 	struct event *orig;	/* Original event if cloned */
+	int num_clones;		/* number of clones for this event */
 	struct jevent_extra extra;
 	struct efd {
 		int fd;
@@ -33,14 +34,20 @@ struct eventlist {
 
 int parse_events(struct eventlist *el, char *events);
 int setup_events(struct eventlist *el, bool measure_all, int measure_pid);
-int setup_events_cpumask(struct eventlist *el, bool measure_all, int measure_pid,
-			 char *cpumask, bool enable_on_exec);
+int setup_events_cpumask(struct eventlist *el, int measure_pid,
+			 char *cpumask, int flags);
 int setup_event(struct event *e, int cpu, struct event *leader, bool measure_all,
-		int measure_pid, bool enable_on_exec);
+		int measure_pid);
+int setup_event_flags(struct event *e, int cpu, struct event *leader, int measure_pid,
+		      int flags);
+#define SE_ENABLE_ON_EXEC (1 << 0)
+#define SE_MEASURE_ALL    (1 << 1)
+
 int read_event(struct event *e, int cpu);
 int read_all_events(struct eventlist *el);
 struct eventlist *alloc_eventlist(void);
 uint64_t event_scaled_value(struct event *e, int cpu);
+uint64_t event_scaled_value_sum(struct event *e, int cpu);
 void free_eventlist(struct eventlist *el);
 void print_event_list_attr(struct eventlist *el, FILE *f);
 
