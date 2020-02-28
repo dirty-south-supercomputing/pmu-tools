@@ -60,7 +60,7 @@ class CPU:
                 self.cpu = i[0]
                 break
         if self.cpu is None:
-            print "Unknown FORCECPU ",force
+            print("Unknown FORCECPU ",force)
         return True
 
     def force_counters(self):
@@ -149,7 +149,8 @@ class CPU:
                 elif n[0] == "flags":
                     seen.add("flags")
                     self.has_tsx = "rtm" in n
-                    self.hypervisor = "hypervisor" in n
+                    if "hypervisor" in n:
+                        self.hypervisor = True
                 elif n[0] == "stepping":
                     seen.add("stepping")
                     self.step = int(n[2])
@@ -168,7 +169,11 @@ class CPU:
             # when running in a hypervisor always assume worst case HT in on
             # also when CPUs are offline assume SMT is on
             elif self.ht or self.hypervisor or (num_offline_cpus() > 0 and not nocheck):
-                self.counters = 4
+                if self.cpu == "icl":
+                    self.counters = 4 # XXX fixme to 8, but 4 works for now
+                    self.standard_counters = "0,1,2,3,4,5,6,7"
+                else:
+                    self.counters = 4
             else:
                 self.counters = 8
             if not nocheck and reduced_counters():
