@@ -27,7 +27,9 @@ from tl_stat import ComputeStat, ValStat, deprecated_combine_valstat
 import tl_cpu
 import tl_output
 import ocperf
+import event_download
 from tl_uval import UVal, combine_uval
+from tl_io import flex_open_r, flex_open_w, popentext
 
 known_cpus = (
     ("snb", (42, )),
@@ -42,8 +44,8 @@ known_cpus = (
     ("simple", ()),
     ("skl", (94, 78, 142, 158, )),
     ("knl", (87, )),
-    ("skx", ((85, 4,) )),
-    ("clx", ((85, 5,) )),
+    ("skx", ((85, 4,), )),
+    ("clx", ((85, 5,), )),
     ("icl", (126, )),
 )
 
@@ -160,7 +162,7 @@ class PerfFeatures:
         self.supports_power = (
                 not args.no_uncore
                 and not args.force_hypervisor
-                and works(perf + " list  | grep -q power/"))
+                and works(perf + " stat -e power/energy-cores/ -a true"))
         # guests don't support offcore response
         if event_nocheck:
             self.supports_ocr = True
@@ -391,10 +393,12 @@ g.add_argument('--long-desc', help='Print long descriptions instead of abbreviat
 g.add_argument('--columns', help='Print CPU output in multiple columns for each node', action='store_true')
 g.add_argument('--summary', help='Print summary at the end. Only useful with -I', action='store_true')
 g.add_argument('--no-area', help='Hide area column', action='store_true')
-g.add_argument('--perf-output', help='Save perf stat output in specified file', type=argparse.FileType('w'))
+g.add_argument('--perf-output', help='Save perf stat output in specified file')
+g.add_argument('--no-perf', help="Don't print perf command line", action='store_true')
+g.add_argument('--print', help="Only print perf command line. Don't run", action='store_true')
 
 g = p.add_argument_group('Environment')
-g.add_argument('--force-cpu', help='Force CPU type', choices=[x[0] for x in known_cpus if not x[0] == "simple"])
+g.add_argument('--force-cpu', help='Force CPU type', choices=[x[0] for x in known_cpus])
 g.add_argument('--force-topology', metavar='findsysoutput', help='Use specified topology file (find /sys/devices)')
 g.add_argument('--force-cpuinfo', metavar='cpuinfo', help='Use specified cpuinfo file (/proc/cpuinfo)')
 g.add_argument('--force-hypervisor', help='Assume running under hypervisor (no uncore, no offcore, no PEBS)', action='store_true')
@@ -405,7 +409,7 @@ g = p.add_argument_group('Additional information')
 g.add_argument('--print-group', '-g', help='Print event group assignments',
                action='store_true')
 g.add_argument('--raw', help="Print raw values", action='store_true')
-g.add_argument('--valcsv', '-V', help='Write raw counter values into CSV file', type=argparse.FileType('w'))
+g.add_argument('--valcsv', '-V', help='Write raw counter values into CSV file')
 g.add_argument('--stats', help='Show statistics on what events counted', action='store_true')
 
 g = p.add_argument_group('Sampling')
@@ -425,6 +429,36 @@ import_mode = args._import is not None
 event_nocheck = import_mode or args.no_check
 
 feat = PerfFeatures(args)
+
+def gen_cpu_name(cpu):
+    if cpu == "simple":
+        return event_download.get_cpustr()
+    for j in known_cpus:
+        if cpu == j[0]:
+            if isinstance(j[1][0], tuple):
+                return "GenuineIntel-6-%02X-%d" % j[1][0]
+            else:
+                return "GenuineIntel-6-%02X" % j[1][0]
+    assert False
+
+env = tl_cpu.Env()
+
+if args.force_cpu:
+    env.forcecpu = args.force_cpu
+    cpu = gen_cpu_name(args.force_cpu)
+    if not os.getenv("EVENTMAP"):
+        os.environ["EVENTMAP"] = cpu
+    if not os.getenv("UNCORE"):
+        os.environ["UNCORE"] = cpu
+if args.force_topology:
+    if not os.getenv("TOPOLOGY"):
+        os.environ["TOPOLOGY"] = args.force_topology
+        ocperf.topology = None # force reread
+if args.force_cpuinfo:
+    env.cpuinfo = args.force_cpuinfo
+if args.force_hypervisor:
+    env.hypervisor = True
+
 emap = ocperf.find_emap()
 if not emap:
     sys.exit("Unknown CPU or CPU event map not found.")
@@ -441,6 +475,18 @@ if args.pid:
     rest = ["--pid", args.pid] + rest
 if args.csv and len(args.csv) != 1:
     sys.exit("--csv/-x argument can be only a single character")
+
+if args.valcsv:
+    try:
+        args.valcsv = flex_open_w(args.valcsv)
+    except IOError:
+        sys.exit("Cannot open valcsv file")
+
+if args.perf_output:
+    try:
+        args.perf_output = flex_open_w(args.perf_output)
+    except IOError:
+        sys.exit("Cannot open perf output file")
 
 if args.all:
     args.tsx = True
@@ -469,13 +515,8 @@ if args.graph:
     cmd = "PATH=$PATH:%s ; tl-barplot.py %s /dev/stdin" % (exe_dir(), extra)
     if not args.quiet:
         print(cmd)
-    try:
-        # python 3
-        args.output = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, text=True).stdin
-    except TypeError:
-        # python 2
-        args.output = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE).stdin
-
+    graphp = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE, **popentext)
+    args.output = graphp.stdin
 if args.sample_repeat:
     args.run_sample = True
 
@@ -502,30 +543,6 @@ def check_ratio(l):
         return True
     return 0 - MAX_ERROR < l < 1 + MAX_ERROR
 
-def gen_cpu_name(cpu):
-    for j in known_cpus:
-        if cpu == j[0]:
-            if isinstance(j[1][0], int):
-                if cpu == "skx":
-                    return "GenuineIntel-6-%02X-4" % j[1][0]
-                return "GenuineIntel-6-%02X" % j[1][0]
-            return "GenuineIntel-6-%02X-%02X" % j[1][0]
-    assert False
-
-env = tl_cpu.Env()
-
-if args.force_cpu:
-    env.forcecpu = args.force_cpu
-    if not os.getenv("EVENTMAP"):
-        os.putenv("EVENTMAP", gen_cpu_name(args.force_cpu))
-if args.force_topology:
-    if not os.getenv("TOPOLOGY"):
-        os.putenv("TOPOLOGY", args.force_topology)
-if args.force_cpuinfo:
-    env.cpuinfo = args.force_cpuinfo
-if args.force_hypervisor:
-    env.hypervisor = True
-
 cpu = tl_cpu.CPU(known_cpus, nocheck=event_nocheck, env=env)
 
 if cpu.hypervisor:
@@ -537,7 +554,7 @@ if cpu.hypervisor or args.no_uncore:
     feat.supports_power = False
 
 def print_perf(r):
-    if args.quiet:
+    if args.quiet or args.no_perf:
         return
     l = ["'" + x + "'" if x.find("{") >= 0 else x for x in r]
     l = [x.replace(";", "\;") for x in l]
@@ -569,7 +586,7 @@ class PerfRun:
     def execute(self, r):
         if import_mode:
             self.perf = None
-            return open(args._import, 'r')
+            return flex_open_r(args._import)
 
         if args.gen_script:
             gen_script(r)
@@ -581,6 +598,8 @@ class PerfRun:
         n = r.index("--log-fd")
         r[n + 1] = "%d" % (inp)
         print_perf(r)
+        if args.print:
+            sys.exit(0)
         self.perf = subprocess.Popen(r, close_fds=False)
         os.close(inp)
         return os.fdopen(outp, 'r')
@@ -837,9 +856,13 @@ def verify_rev(rev, cpus):
             assert o == rev[cpus[0]][ind]
         assert len(rev[k]) == len(rev[cpus[0]])
 
+# from https://stackoverflow.com/questions/4836710/does-python-have-a-built-in-function-for-string-natural-sort
+def num_key(s):
+    return [int(t) if t.isdigit() else t for t in re.split('(\d+)', s)]
+
 def print_keys(runner, res, rev, valstats, out, interval, env, mode):
     stat = runner.stat
-    keys = sorted(res.keys())
+    keys = sorted(res.keys(), key=num_key)
     out.set_cpus(display_keys(runner, keys, mode))
     if smt_mode:
         printed_cores = set()
@@ -848,7 +871,7 @@ def print_keys(runner, res, rev, valstats, out, interval, env, mode):
             if j != "" and int(j) not in cpu.cputocore:
                  warn_once("Warning: input cpu %s not in cpuinfo." % j)
                  del res[j]
-        keys = sorted(res.keys())
+        keys = sorted(res.keys(), key=num_key)
         for j in keys:
             if j != "" and int(j) not in runner.allowed_threads:
                 continue
@@ -960,7 +983,7 @@ def print_keys(runner, res, rev, valstats, out, interval, env, mode):
     stat.compute_errors()
 
 def print_and_split_keys(runner, res, rev, valstats, out, interval, env):
-    if args.per_core + args.per_thread + args.per_socket + args._global > 1:
+    if args.per_core + args.per_thread + args.per_socket + args._global >= 1:
         if args.per_thread:
             out.remark("Per thread")
             out.reset("thread")
@@ -978,6 +1001,8 @@ def print_and_split_keys(runner, res, rev, valstats, out, interval, env):
             out.reset("global")
             print_keys(runner, res, rev, valstats, out, interval, env, OUTPUT_GLOBAL)
     else:
+        if args.split_output:
+            sys.exit("--split-output needs --per-thread / --global / --per-socket / --per-core")
         mode = OUTPUT_CORE_THREAD
         if args.per_thread:
             mode = OUTPUT_THREAD
@@ -1692,7 +1717,7 @@ class Runner:
         def want_node(obj):
             if args.reduced and has(obj, 'server') and not obj.server:
                 return False
-            if args.no_uncore and has(obj, 'domain') and obj.area == "Info.System":
+            if args.no_uncore and has(obj, 'area') and obj.area == "Info.System":
                 return False
             want = ((obj.metric and args.metrics) or obj.name in add_met or obj in parents) and not obj.name in remove_met
             if not obj.metric and obj.level <= self.max_level:
@@ -2326,4 +2351,7 @@ else:
     ret = measure_and_sample(None)
 
 out.print_footer()
+if args.graph:
+    args.output.close()
+    graphp.wait()
 sys.exit(ret)

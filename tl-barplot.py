@@ -1,6 +1,11 @@
 #!/usr/bin/env python2
 # plot toplev -I... -x, -o ...csv output as bar plot
 #
+from __future__ import print_function
+import os
+import matplotlib
+if os.getenv('DISPLAY') is None:
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import argparse
 import math
@@ -8,6 +13,7 @@ from collections import defaultdict
 import gen_level
 import tldata
 import re
+import sys
 
 def parse_args():
     p = argparse.ArgumentParser(usage='plot toplev -I...  -x, output as bar plot')
@@ -27,7 +33,7 @@ try:
     import brewer2mpl
 except ImportError:
     if not args.quiet:
-        print "pip install brewer2mpl for better colors"
+        print("pip install brewer2mpl for better colors")
 
 if args.xkcd:
     plt.xkcd()
@@ -39,12 +45,16 @@ levels = data.levels
 timestamps = data.times
 ratios = defaultdict(list)
 # XXX plot multiple cpus instead
+cpu = None
 if args.cpu:
     cpu = args.cpu
+elif 'CLKS' in data.headers and len(data.vals) > 0:
+    # pick CPU with highest utilization. XXX look at all time series
+    util = sorted([(data.vals[0][x], x[1]) for x in data.vals[0].keys() if x[0] == 'CLKS'],
+                  reverse=True)
+    cpu = util[0][1]
 elif len(data.cpus) > 0:
     cpu = sorted(sorted(data.cpus), key=len, reverse=True)[0]
-else:
-    cpu = None
 
 def cpumatch(x, match, base):
     return x.startswith(cpu) or x == base
@@ -55,7 +65,7 @@ if cpu:
     if m:
         base = m.group(0)
     aliases = [x for x in data.cpus if cpumatch(x, cpu, base)]
-    print "plotting cpus:", " ".join(sorted(aliases))
+    print("plotting cpus:", " ".join(sorted(aliases)))
 else:
     aliases = []
 if len(aliases) == 0:
